@@ -1,1 +1,3 @@
 doc_nmt_mamba/outputs/
+doc_nmt_mamba/outputs/
+*.pt
