@@ -2,12 +2,13 @@
 
 # Training loop
 max_steps: 100000
-batch_size: 64  # H100 80GB enables larger batch
+batch_size: 64  # H100 80GB enables larger batch (per GPU in distributed)
 gradient_accumulation_steps: 1
 max_grad_norm: 1.0
 
 # Optimization
-learning_rate: 1e-4  # Conservative for Mamba stability
+# LR scaled for DDP: 2x GPUs = 2x effective batch = ~sqrt(2) or 2x LR
+learning_rate: 2e-4  # Scaled from 1e-4 for DDP (2x batch size)
 weight_decay: 0.01
 betas: [0.9, 0.95]
 
@@ -27,6 +28,15 @@ compile_mode: max-autotune
 # H100 optimizations
 tf32_matmul: true
 cudnn_benchmark: true
+channels_last: true  # Use channels-last memory format for potential speedup
+
+# Distributed training (for multi-GPU)
+# Strategy: "none" (single GPU), "ddp" (DataParallel), "fsdp" (FullyShard), "fsdp_full"
+distributed_strategy: ddp
+find_unused_parameters: false  # Faster if all params used
+static_graph: true  # Enable for torch.compile compatibility
+fsdp_sharding: full_shard  # For FSDP: "full_shard", "shard_grad_op", "no_shard"
+fsdp_cpu_offload: false  # Enable if running out of GPU memory
 
 # Logging and checkpointing
 log_steps: 100

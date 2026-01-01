@@ -2,10 +2,17 @@
 """
 Training script for Document-Level NMT with Hybrid Mamba-Attention.
 
-Usage:
+Single GPU:
     python scripts/train.py                           # Default config
     python scripts/train.py model=medium              # Medium model (200M params)
     python scripts/train.py training.batch_size=32    # Custom batch size
+
+Multi-GPU (DDP):
+    torchrun --nproc_per_node=2 scripts/train.py      # Use both H100 GPUs
+    torchrun --nproc_per_node=2 scripts/train.py training.distributed_strategy=ddp
+
+Multi-GPU (FSDP for large models):
+    torchrun --nproc_per_node=2 scripts/train.py training.distributed_strategy=fsdp
 
 Hydra configuration from configs/ directory.
 """
@@ -19,7 +26,8 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -35,7 +43,7 @@ from data import (
     create_dataset,
     create_collator,
 )
-from training import Trainer, TrainerConfig
+from training import Trainer, TrainerConfig, setup_distributed
 
 
 def setup_environment():
@@ -46,8 +54,11 @@ def setup_environment():
     torch.backends.cudnn.benchmark = True
 
     # Set memory allocator for better efficiency
-    if hasattr(torch.cuda, "memory"):
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    # NCCL optimizations for NVLink
+    os.environ.setdefault("NCCL_IB_DISABLE", "0")
+    os.environ.setdefault("NCCL_P2P_LEVEL", "NVL")  # Use NVLink for P2P
 
 
 def create_model(cfg: DictConfig, device: str, dtype: torch.dtype) -> HybridMambaEncoderDecoder:
@@ -78,8 +89,8 @@ def create_model(cfg: DictConfig, device: str, dtype: torch.dtype) -> HybridMamb
     return model
 
 
-def create_dataloaders(cfg: DictConfig, tokenizer):
-    """Create training and validation dataloaders."""
+def create_dataloaders(cfg: DictConfig, tokenizer, dist_info: dict):
+    """Create training and validation dataloaders with distributed support."""
     # Get dataset name from config (default: opus_books for document-level)
     dataset_name = cfg.data.get("dataset_name", "opus_books")
 
@@ -115,58 +126,100 @@ def create_dataloaders(cfg: DictConfig, tokenizer):
         pad_token_id=tokenizer.pad_token_id,
     )
 
-    # Create dataloaders
-    # Handle prefetch_factor: only valid when num_workers > 0
+    # Create samplers for distributed training
+    world_size = dist_info.get("world_size", 1)
+    rank = dist_info.get("rank", 0)
+
+    if world_size > 1:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+        )
+        shuffle_train = False  # Sampler handles shuffling
+    else:
+        train_sampler = None
+        val_sampler = None
+        shuffle_train = True
+
+    # Create dataloaders with optimized settings
+    num_workers = cfg.data.get("num_workers", 8)
+    pin_memory = cfg.data.get("pin_memory", True) and num_workers > 0
+    persistent_workers = cfg.data.get("persistent_workers", True) and num_workers > 0
+
     loader_kwargs = {
         "batch_size": cfg.training.batch_size,
-        "num_workers": cfg.data.num_workers,
+        "num_workers": num_workers,
         "collate_fn": collator,
-        "pin_memory": True if cfg.data.num_workers > 0 else False,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+        "drop_last": cfg.data.get("drop_last", False),
     }
-    if cfg.data.num_workers > 0 and cfg.data.get("prefetch_factor"):
+
+    if num_workers > 0 and cfg.data.get("prefetch_factor"):
         loader_kwargs["prefetch_factor"] = cfg.data.prefetch_factor
 
     train_loader = DataLoader(
         train_dataset,
-        shuffle=True,
+        sampler=train_sampler,
+        shuffle=shuffle_train if train_sampler is None else False,
         **loader_kwargs,
     )
 
     val_loader = DataLoader(
         val_dataset,
+        sampler=val_sampler,
         shuffle=False,
         **loader_kwargs,
     )
 
-    print(f"Train samples: {len(train_dataset)}")
-    print(f"Val samples: {len(val_dataset)}")
+    if dist_info.get("is_main", True):
+        print(f"Train samples: {len(train_dataset)}")
+        print(f"Val samples: {len(val_dataset)}")
+        if world_size > 1:
+            print(f"Distributed: {world_size} GPUs, {len(train_dataset) // world_size} samples/GPU")
 
     return train_loader, val_loader
 
 
 @hydra.main(config_path="../configs", config_name="config", version_base=None)
 def main(cfg: DictConfig):
-    """Main training function."""
-    print("=" * 60)
-    print("Document-Level NMT with Hybrid Mamba-Attention")
-    print("=" * 60)
-    print(OmegaConf.to_yaml(cfg))
-
-    # Setup environment
+    """Main training function with distributed support."""
+    # Setup environment first
     setup_environment()
+
+    # Setup distributed training (handles both single and multi-GPU)
+    dist_info = setup_distributed()
+    is_main = dist_info.get("is_main", True)
+
+    if is_main:
+        print("=" * 60)
+        print("Document-Level NMT with Hybrid Mamba-Attention")
+        print("=" * 60)
+        print(OmegaConf.to_yaml(cfg))
 
     # Check CUDA
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for training")
 
-    device = "cuda"
+    device = dist_info["device"]
     dtype = torch.bfloat16 if cfg.training.use_bf16 else torch.float32
 
-    print(f"\nDevice: {torch.cuda.get_device_name(0)}")
-    print(f"Dtype: {dtype}")
+    if is_main:
+        print(f"\nDevice: {torch.cuda.get_device_name(device.index if device.index else 0)}")
+        print(f"Dtype: {dtype}")
+        print(f"World Size: {dist_info['world_size']}")
 
     # Create tokenizer
-    print("\nLoading tokenizer...")
+    if is_main:
+        print("\nLoading tokenizer...")
     tokenizer_type = cfg.data.get("tokenizer_type", "custom")
     tokenizer_path = cfg.data.get("tokenizer_path", "data/tokenizer/tokenizer.json")
 
@@ -177,33 +230,38 @@ def main(cfg: DictConfig):
             tokenizer_path=tokenizer_path,
             max_length=cfg.data.max_src_length,
         )
-        print(f"Using Custom 32K BPE tokenizer (RECOMMENDED)")
+        if is_main:
+            print(f"Using Custom 32K BPE tokenizer (RECOMMENDED)")
     else:
         # NOT RECOMMENDED: mBART 250K vocab makes model 95% embedding table
         import warnings
-        warnings.warn(
-            "Using mBART tokenizer (250K vocab). "
-            "This makes the model 95% embedding table. "
-            "Use tokenizer_type='custom' for thesis work."
-        )
+        if is_main:
+            warnings.warn(
+                "Using mBART tokenizer (250K vocab). "
+                "This makes the model 95% embedding table. "
+                "Use tokenizer_type='custom' for thesis work."
+            )
         tokenizer = NMTTokenizer(
             src_lang=cfg.data.src_lang,
             tgt_lang=cfg.data.tgt_lang,
         )
-    print(f"Vocab size: {tokenizer.vocab_size}")
+    if is_main:
+        print(f"Vocab size: {tokenizer.vocab_size}")
 
     # Override model vocab size from tokenizer
     cfg.model.vocab_size = tokenizer.vocab_size
 
     # Create model
-    print("\nCreating model...")
-    model = create_model(cfg, device, dtype)
+    if is_main:
+        print("\nCreating model...")
+    model = create_model(cfg, str(device), dtype)
 
-    # Create dataloaders
-    print("\nCreating dataloaders...")
-    train_loader, val_loader = create_dataloaders(cfg, tokenizer)
+    # Create dataloaders with distributed support
+    if is_main:
+        print("\nCreating dataloaders...")
+    train_loader, val_loader = create_dataloaders(cfg, tokenizer, dist_info)
 
-    # Create trainer config
+    # Create trainer config with distributed settings
     trainer_config = TrainerConfig(
         max_steps=cfg.training.max_steps,
         batch_size=cfg.training.batch_size,
@@ -223,10 +281,18 @@ def main(cfg: DictConfig):
         log_steps=cfg.training.log_steps,
         eval_steps=cfg.training.eval_steps,
         gradient_checkpointing=cfg.training.gradient_checkpointing,
+        channels_last=cfg.training.get("channels_last", True),
+        # Distributed settings
+        distributed_strategy=cfg.training.get("distributed_strategy", "ddp"),
+        find_unused_parameters=cfg.training.get("find_unused_parameters", False),
+        static_graph=cfg.training.get("static_graph", True),
+        fsdp_sharding=cfg.training.get("fsdp_sharding", "full_shard"),
+        fsdp_cpu_offload=cfg.training.get("fsdp_cpu_offload", False),
     )
 
     # Create trainer
-    print("\nInitializing trainer...")
+    if is_main:
+        print("\nInitializing trainer...")
     trainer = Trainer(
         model=model,
         train_dataloader=train_loader,
@@ -239,10 +305,12 @@ def main(cfg: DictConfig):
         trainer.load_checkpoint(cfg.training.resume_from)
 
     # Train
-    print("\nStarting training...")
+    if is_main:
+        print("\nStarting training...")
     trainer.train()
 
-    print("\nTraining complete!")
+    if is_main:
+        print("\nTraining complete!")
 
 
 if __name__ == "__main__":

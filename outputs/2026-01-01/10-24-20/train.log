@@ -1,0 +1,24 @@
+[2026-01-01 10:24:21,094][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'iwslt2017' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+[2026-01-01 10:24:21,145][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'iwslt2017' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+[2026-01-01 10:24:21,336][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'wmt14' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+[2026-01-01 10:24:21,341][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'wmt14' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+[2026-01-01 10:26:57,084][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'iwslt2017' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+[2026-01-01 10:26:57,213][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'wmt14' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+[2026-01-01 10:26:59,123][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'iwslt2017' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+[2026-01-01 10:26:59,251][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'wmt14' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.

@@ -5,17 +5,62 @@ This is used for decoder-to-encoder attention, which is O(L_src) per step
 but still faster than Transformer's O(L_src + L_tgt).
 
 Supports VarLen mode for packed sequence training (20-30% H100 speedup).
+Supports fallback to PyTorch SDPA when flash-attn is not available.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional
 
-from flash_attn import flash_attn_func
-from flash_attn import flash_attn_varlen_func
+# Try to import flash_attn, fallback to PyTorch SDPA if not available
+try:
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+    flash_attn_func = None
+    flash_attn_varlen_func = None
 
 from ..mamba2.norms import RMSNorm
 from .rope import RotaryPositionalEmbedding
+
+
+def sdpa_cross_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float = 0.0,
+    training: bool = True,
+) -> torch.Tensor:
+    """
+    PyTorch native scaled dot-product cross-attention fallback.
+
+    Args:
+        q: Query tensor (batch, seq_len_q, n_heads, head_dim)
+        k: Key tensor (batch, seq_len_k, n_heads, head_dim)
+        v: Value tensor (batch, seq_len_k, n_heads, head_dim)
+        dropout_p: Dropout probability
+        training: Whether in training mode
+
+    Returns:
+        Output tensor (batch, seq_len_q, n_heads, head_dim)
+    """
+    # Transpose to (batch, n_heads, seq_len, head_dim) for SDPA
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    # Use PyTorch's optimized SDPA
+    out = F.scaled_dot_product_attention(
+        q, k, v,
+        attn_mask=None,
+        dropout_p=dropout_p if training else 0.0,
+        is_causal=False,  # Cross-attention is never causal
+    )
+
+    # Transpose back to (batch, seq_len, n_heads, head_dim)
+    return out.transpose(1, 2)
 
 
 class FlashCrossAttention(nn.Module):
@@ -131,18 +176,32 @@ class FlashCrossAttention(nn.Module):
 
             # Note: RoPE skipped in packed mode (Mamba handles positions)
 
-            # FlashAttention-2 VarLen cross-attention
-            out = flash_attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                dropout_p=self.dropout if self.training else 0.0,
-                causal=False,
-            )
+            if FLASH_ATTN_AVAILABLE:
+                # FlashAttention-2 VarLen cross-attention
+                out = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    causal=False,
+                )
+            else:
+                # Fallback: unpack sequences and use PyTorch SDPA
+                batch_size = cu_seqlens_q.size(0) - 1
+                outputs = []
+                for i in range(batch_size):
+                    q_start, q_end = cu_seqlens_q[i].item(), cu_seqlens_q[i + 1].item()
+                    k_start, k_end = cu_seqlens_k[i].item(), cu_seqlens_k[i + 1].item()
+                    q_i = q[q_start:q_end].unsqueeze(0)
+                    k_i = k[k_start:k_end].unsqueeze(0)
+                    v_i = v[k_start:k_end].unsqueeze(0)
+                    out_i = sdpa_cross_attention(q_i, k_i, v_i, self.dropout, training=self.training)
+                    outputs.append(out_i.squeeze(0))
+                out = torch.cat(outputs, dim=0)
 
             # Reshape and project output
             out = out.view(total_dec_tokens, self.d_model)
@@ -175,15 +234,23 @@ class FlashCrossAttention(nn.Module):
                 q = q.transpose(1, 2)
                 k = k.transpose(1, 2)
 
-            # FlashAttention-2: expects (B, T, H, D)
-            # causal=False for cross-attention
-            out = flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=self.dropout if self.training else 0.0,
-                causal=False,
-            )
+            if FLASH_ATTN_AVAILABLE:
+                # FlashAttention-2: expects (B, T, H, D)
+                # causal=False for cross-attention
+                out = flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    causal=False,
+                )
+            else:
+                # PyTorch SDPA fallback
+                out = sdpa_cross_attention(
+                    q, k, v,
+                    dropout_p=self.dropout,
+                    training=self.training,
+                )
 
             # Reshape and project output
             out = out.view(B, T_dec, self.d_model)

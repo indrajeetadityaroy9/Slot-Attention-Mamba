@@ -1,0 +1,8 @@
+- model=base_transformer
+- training.output_dir=outputs/baseline
+- training.max_steps=50000
+- training.batch_size=64
+- training.use_compile=true
+- training.log_steps=100
+- training.eval_steps=2500
+- training.save_steps=5000

@@ -1,0 +1,84 @@
+model:
+  name: base_transformer
+  encoder_layers: 12
+  decoder_layers: 12
+  d_model: 512
+  d_state: 64
+  d_conv: 4
+  expand: 2
+  attention_ratio: 1.0
+  n_heads: 8
+  head_dim: 64
+  cross_attn_every: 4
+  dropout: 0.1
+  max_seq_len: 8192
+  rope_theta: 10000.0
+  vocab_size: 32768
+  pad_token_id: 0
+  bos_token_id: 1
+  eos_token_id: 2
+training:
+  max_steps: 50000
+  batch_size: 64
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.95
+  scheduler_type: cosine
+  warmup_steps: 4000
+  min_lr: 1.0e-06
+  gradient_checkpointing: true
+  use_bf16: true
+  use_compile: true
+  compile_mode: max-autotune
+  tf32_matmul: true
+  cudnn_benchmark: true
+  channels_last: true
+  distributed_strategy: ddp
+  find_unused_parameters: false
+  static_graph: true
+  fsdp_sharding: full_shard
+  fsdp_cpu_offload: false
+  log_steps: 100
+  eval_steps: 2500
+  save_steps: 5000
+  save_total_limit: 3
+  output_dir: outputs/baseline
+  label_smoothing: 0.1
+  seed: 42
+  deterministic: false
+  resume_from: null
+data:
+  name: iwslt14_de_en
+  dataset_name: iwslt14
+  tokenizer_type: custom
+  tokenizer_path: data/tokenizer/tokenizer.json
+  src_lang: de_DE
+  tgt_lang: en_XX
+  max_src_length: 4096
+  max_tgt_length: 4096
+  cat_n: 5
+  p_concat: 0.5
+  collator_mode: packed
+  num_workers: 16
+  prefetch_factor: 4
+  persistent_workers: true
+  pin_memory: true
+  drop_last: false
+project:
+  name: doc_nmt_mamba
+  seed: 42
+  output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+logging:
+  level: INFO
+  wandb:
+    enabled: false
+    project: doc-nmt-mamba
+    entity: null
+    tags:
+    - hybrid
+    - mamba
+    - nmt

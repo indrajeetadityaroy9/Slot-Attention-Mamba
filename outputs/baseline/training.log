@@ -1,0 +1,416 @@
+W0101 10:40:11.378000 186578 torch/distributed/run.py:803] 
+W0101 10:40:11.378000 186578 torch/distributed/run.py:803] *****************************************
+W0101 10:40:11.378000 186578 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0101 10:40:11.378000 186578 torch/distributed/run.py:803] *****************************************
+============================================================
+Document-Level NMT with Hybrid Mamba-Attention
+============================================================
+model:
+  name: base_transformer
+  encoder_layers: 12
+  decoder_layers: 12
+  d_model: 512
+  d_state: 64
+  d_conv: 4
+  expand: 2
+  attention_ratio: 1.0
+  n_heads: 8
+  head_dim: 64
+  cross_attn_every: 4
+  dropout: 0.1
+  max_seq_len: 8192
+  rope_theta: 10000.0
+  vocab_size: 32768
+  pad_token_id: 0
+  bos_token_id: 1
+  eos_token_id: 2
+training:
+  max_steps: 50000
+  batch_size: 32
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.95
+  scheduler_type: cosine
+  warmup_steps: 4000
+  min_lr: 1.0e-06
+  gradient_checkpointing: true
+  use_bf16: true
+  use_compile: false
+  compile_mode: max-autotune
+  tf32_matmul: true
+  cudnn_benchmark: true
+  channels_last: true
+  distributed_strategy: ddp
+  find_unused_parameters: false
+  static_graph: true
+  fsdp_sharding: full_shard
+  fsdp_cpu_offload: false
+  log_steps: 100
+  eval_steps: 2500
+  save_steps: 5000
+  save_total_limit: 3
+  output_dir: outputs/baseline
+  label_smoothing: 0.1
+  seed: 42
+  deterministic: false
+  resume_from: null
+data:
+  name: iwslt14_de_en
+  dataset_name: iwslt14
+  tokenizer_type: custom
+  tokenizer_path: data/tokenizer/tokenizer.json
+  src_lang: de_DE
+  tgt_lang: en_XX
+  max_src_length: 4096
+  max_tgt_length: 4096
+  cat_n: 5
+  p_concat: 0.5
+  collator_mode: packed
+  num_workers: 16
+  prefetch_factor: 4
+  persistent_workers: true
+  pin_memory: true
+  drop_last: false
+project:
+  name: doc_nmt_mamba
+  seed: 42
+  output_dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+logging:
+  level: INFO
+  wandb:
+    enabled: false
+    project: doc-nmt-mamba
+    entity: null
+    tags:
+    - hybrid
+    - mamba
+    - nmt
+
+
+Device: NVIDIA H100 80GB HBM3
+Dtype: torch.bfloat16
+World Size: 2
+
+Loading tokenizer...
+Using Custom 32K BPE tokenizer (RECOMMENDED)
+Vocab size: 32768
+
+Creating model...
+Created model with 61.9M parameters
+Encoder: {'mamba': 0, 'bimamba': 0, 'attention': 12, 'cross_attention': 0}
+Decoder: {'mamba': 0, 'bimamba': 0, 'attention': 12, 'cross_attention': 3}
+
+Creating dataloaders...
+/lambda/nfs/lambda-cloud-data/NMT_English_to_Vietnamese/doc_nmt_mamba/data/document_dataset.py:485: UserWarning: IWSLT14 falls back to WMT14 which is shuffled sentence-level data. This does NOT preserve document boundaries. Use dataset_name='opus_books' for document-level NMT.
+  warnings.warn(
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'iwslt2017' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+[2026-01-01 10:40:14,846][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'iwslt2017' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Created model with 61.9M parameters
+Encoder: {'mamba': 0, 'bimamba': 0, 'attention': 12, 'cross_attention': 0}
+Decoder: {'mamba': 0, 'bimamba': 0, 'attention': 12, 'cross_attention': 3}
+/lambda/nfs/lambda-cloud-data/NMT_English_to_Vietnamese/doc_nmt_mamba/data/document_dataset.py:485: UserWarning: IWSLT14 falls back to WMT14 which is shuffled sentence-level data. This does NOT preserve document boundaries. Use dataset_name='opus_books' for document-level NMT.
+  warnings.warn(
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'iwslt2017' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+[2026-01-01 10:40:14,852][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'iwslt2017' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+IWSLT2017 loading failed: Dataset scripts are no longer supported, but found iwslt2017.py
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'wmt14' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+[2026-01-01 10:40:15,015][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'wmt14' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+IWSLT2017 loading failed: Dataset scripts are no longer supported, but found iwslt2017.py
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'wmt14' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+[2026-01-01 10:40:15,018][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'wmt14' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Using WMT14 dataset instead (4508785 samples)
+/lambda/nfs/lambda-cloud-data/NMT_English_to_Vietnamese/doc_nmt_mamba/data/document_dataset.py:485: UserWarning: IWSLT14 falls back to WMT14 which is shuffled sentence-level data. This does NOT preserve document boundaries. Use dataset_name='opus_books' for document-level NMT.
+  warnings.warn(
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'iwslt2017' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+[2026-01-01 10:42:22,759][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'iwslt2017' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+IWSLT2017 loading failed: Dataset scripts are no longer supported, but found iwslt2017.py
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'wmt14' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+[2026-01-01 10:42:22,882][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'wmt14' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Using WMT14 dataset instead (4508785 samples)
+Using WMT14 dataset instead (3000 samples)
+Train samples: 2003030
+Val samples: 3000
+Distributed: 2 GPUs, 1001515 samples/GPU
+
+Initializing trainer...
+
+============================================================
+DISTRIBUTED TRAINING INFO
+============================================================
+World Size: 2
+Rank: 0
+Local Rank: 0
+Device: cuda:0
+
+GPU Count: 2
+NVLink Available: True
+P2P Access:
+  GPU 0 -> GPU 1: ✓
+  GPU 1 -> GPU 0: ✓
+============================================================
+
+/lambda/nfs/lambda-cloud-data/NMT_English_to_Vietnamese/doc_nmt_mamba/data/document_dataset.py:485: UserWarning: IWSLT14 falls back to WMT14 which is shuffled sentence-level data. This does NOT preserve document boundaries. Use dataset_name='opus_books' for document-level NMT.
+  warnings.warn(
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'iwslt2017' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+[2026-01-01 10:42:25,901][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'iwslt2017' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+IWSLT2017 loading failed: Dataset scripts are no longer supported, but found iwslt2017.py
+`trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'wmt14' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+[2026-01-01 10:42:26,000][datasets.load][ERROR] - `trust_remote_code` is not supported anymore.
+Please check that the Hugging Face dataset 'wmt14' isn't based on a loading script and remove `trust_remote_code`.
+If the dataset is based on a loading script, please ask the dataset author to remove it and convert it to a standard format like Parquet.
+Using WMT14 dataset instead (3000 samples)
+/home/ubuntu/.local/lib/python3.10/site-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+
+Starting training...
+/lambda/nfs/lambda-cloud-data/NMT_English_to_Vietnamese/doc_nmt_mamba/training/trainer.py:255: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast(dtype=torch.bfloat16, enabled=self.config.use_bf16):
+/lambda/nfs/lambda-cloud-data/NMT_English_to_Vietnamese/doc_nmt_mamba/training/trainer.py:255: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast(dtype=torch.bfloat16, enabled=self.config.use_bf16):
+Step 100/50000 | Loss: 528.0671 | LR: 3.54e-06 | Steps/s: 7.00 | Samples/s: 447.9
+Step 200/50000 | Loss: 527.9156 | LR: 6.02e-06 | Steps/s: 8.03 | Samples/s: 514.0
+Step 300/50000 | Loss: 527.8498 | LR: 8.51e-06 | Steps/s: 6.02 | Samples/s: 385.2
+Step 400/50000 | Loss: 527.6199 | LR: 1.10e-05 | Steps/s: 6.57 | Samples/s: 420.2
+Step 500/50000 | Loss: 527.2427 | LR: 1.35e-05 | Steps/s: 8.79 | Samples/s: 562.5
+Step 600/50000 | Loss: 526.7933 | LR: 1.60e-05 | Steps/s: 9.30 | Samples/s: 595.1
+Step 700/50000 | Loss: 525.9451 | LR: 1.85e-05 | Steps/s: 9.66 | Samples/s: 618.3
+Step 800/50000 | Loss: 524.9511 | LR: 2.09e-05 | Steps/s: 9.85 | Samples/s: 630.3
+Step 900/50000 | Loss: 523.8895 | LR: 2.34e-05 | Steps/s: 9.33 | Samples/s: 597.2
+Step 1000/50000 | Loss: 522.7849 | LR: 2.59e-05 | Steps/s: 10.12 | Samples/s: 647.5
+Step 1100/50000 | Loss: 520.3031 | LR: 2.84e-05 | Steps/s: 9.90 | Samples/s: 633.5
+Step 1200/50000 | Loss: 512.7320 | LR: 3.09e-05 | Steps/s: 8.82 | Samples/s: 564.3
+Step 1300/50000 | Loss: 497.1552 | LR: 3.34e-05 | Steps/s: 10.13 | Samples/s: 648.2
+Step 1400/50000 | Loss: 477.5872 | LR: 3.59e-05 | Steps/s: 9.74 | Samples/s: 623.2
+Step 1500/50000 | Loss: 459.4511 | LR: 3.84e-05 | Steps/s: 10.03 | Samples/s: 642.2
+Step 1600/50000 | Loss: 444.9088 | LR: 4.08e-05 | Steps/s: 10.06 | Samples/s: 643.8
+Step 1700/50000 | Loss: 431.3696 | LR: 4.33e-05 | Steps/s: 9.82 | Samples/s: 628.7
+Step 1800/50000 | Loss: 420.2599 | LR: 4.58e-05 | Steps/s: 9.56 | Samples/s: 612.0
+Step 1900/50000 | Loss: 411.4104 | LR: 4.83e-05 | Steps/s: 10.03 | Samples/s: 641.9
+Step 2000/50000 | Loss: 405.5561 | LR: 5.08e-05 | Steps/s: 9.55 | Samples/s: 610.9
+Step 2100/50000 | Loss: 401.3242 | LR: 5.33e-05 | Steps/s: 9.79 | Samples/s: 626.5
+Step 2200/50000 | Loss: 397.6169 | LR: 5.58e-05 | Steps/s: 9.23 | Samples/s: 591.0
+Step 2300/50000 | Loss: 394.9467 | LR: 5.83e-05 | Steps/s: 9.60 | Samples/s: 614.2
+Step 2400/50000 | Loss: 392.8120 | LR: 6.07e-05 | Steps/s: 9.79 | Samples/s: 626.3
+Step 2500/50000 | Loss: 391.9719 | LR: 6.32e-05 | Steps/s: 8.68 | Samples/s: 555.6
+Step 2600/50000 | Loss: 389.3968 | LR: 6.57e-05 | Steps/s: 9.33 | Samples/s: 597.3
+Step 2700/50000 | Loss: 386.9954 | LR: 6.82e-05 | Steps/s: 9.57 | Samples/s: 612.3
+Step 2800/50000 | Loss: 385.9836 | LR: 7.07e-05 | Steps/s: 8.86 | Samples/s: 567.2
+Step 2900/50000 | Loss: 383.8630 | LR: 7.32e-05 | Steps/s: 9.20 | Samples/s: 588.5
+Step 3000/50000 | Loss: 382.5503 | LR: 7.57e-05 | Steps/s: 10.20 | Samples/s: 652.9
+Step 3100/50000 | Loss: 380.8567 | LR: 7.82e-05 | Steps/s: 9.63 | Samples/s: 616.2
+Step 3200/50000 | Loss: 378.7923 | LR: 8.06e-05 | Steps/s: 10.02 | Samples/s: 641.0
+Step 3300/50000 | Loss: 376.7440 | LR: 8.31e-05 | Steps/s: 9.38 | Samples/s: 600.3
+Step 3400/50000 | Loss: 375.9129 | LR: 8.56e-05 | Steps/s: 9.98 | Samples/s: 638.7
+Step 3500/50000 | Loss: 374.1523 | LR: 8.81e-05 | Steps/s: 9.94 | Samples/s: 636.1
+Step 3600/50000 | Loss: 372.5969 | LR: 9.06e-05 | Steps/s: 9.51 | Samples/s: 608.4
+Step 3700/50000 | Loss: 370.2341 | LR: 9.31e-05 | Steps/s: 9.85 | Samples/s: 630.3
+Step 3800/50000 | Loss: 369.1316 | LR: 9.56e-05 | Steps/s: 10.29 | Samples/s: 658.6
+Step 3900/50000 | Loss: 366.5916 | LR: 9.81e-05 | Steps/s: 9.41 | Samples/s: 602.1
+Step 4000/50000 | Loss: 365.4206 | LR: 1.01e-04 | Steps/s: 9.80 | Samples/s: 627.4
+Step 4100/50000 | Loss: 363.1906 | LR: 1.03e-04 | Steps/s: 10.06 | Samples/s: 644.1
+Step 4200/50000 | Loss: 361.4646 | LR: 1.06e-04 | Steps/s: 10.14 | Samples/s: 648.9
+Step 4300/50000 | Loss: 359.2339 | LR: 1.08e-04 | Steps/s: 10.72 | Samples/s: 686.1
+Step 4400/50000 | Loss: 358.5013 | LR: 1.10e-04 | Steps/s: 9.56 | Samples/s: 612.0
+Step 4500/50000 | Loss: 357.4633 | LR: 1.13e-04 | Steps/s: 10.40 | Samples/s: 665.6
+Step 4600/50000 | Loss: 354.4014 | LR: 1.15e-04 | Steps/s: 10.64 | Samples/s: 680.8
+Step 4700/50000 | Loss: 353.7198 | LR: 1.18e-04 | Steps/s: 10.03 | Samples/s: 641.6
+Step 4800/50000 | Loss: 351.7778 | LR: 1.20e-04 | Steps/s: 10.57 | Samples/s: 676.4
+Step 4900/50000 | Loss: 350.9633 | LR: 1.23e-04 | Steps/s: 9.63 | Samples/s: 616.6
+Step 5000/50000 | Loss: 349.9590 | LR: 1.25e-04 | Steps/s: 9.60 | Samples/s: 614.1
+Saved checkpoint to outputs/baseline/checkpoint-5000
+Step 5100/50000 | Loss: 347.3735 | LR: 1.28e-04 | Steps/s: 9.26 | Samples/s: 592.4
+Step 5200/50000 | Loss: 348.6842 | LR: 1.30e-04 | Steps/s: 10.24 | Samples/s: 655.5
+Step 5300/50000 | Loss: 347.2303 | LR: 1.33e-04 | Steps/s: 10.09 | Samples/s: 645.6
+Step 5400/50000 | Loss: 345.7196 | LR: 1.35e-04 | Steps/s: 10.44 | Samples/s: 668.3
+Step 5500/50000 | Loss: 343.5393 | LR: 1.38e-04 | Steps/s: 9.72 | Samples/s: 622.0
+Step 5600/50000 | Loss: 343.9954 | LR: 1.40e-04 | Steps/s: 10.25 | Samples/s: 656.1
+Step 5700/50000 | Loss: 341.7574 | LR: 1.43e-04 | Steps/s: 10.22 | Samples/s: 654.0
+Step 5800/50000 | Loss: 340.0136 | LR: 1.45e-04 | Steps/s: 9.85 | Samples/s: 630.1
+Step 5900/50000 | Loss: 339.1822 | LR: 1.48e-04 | Steps/s: 10.29 | Samples/s: 658.5
+Step 6000/50000 | Loss: 339.1685 | LR: 1.50e-04 | Steps/s: 9.31 | Samples/s: 595.9
+Step 6100/50000 | Loss: 337.6708 | LR: 1.53e-04 | Steps/s: 10.15 | Samples/s: 649.7
+Step 6200/50000 | Loss: 335.8182 | LR: 1.55e-04 | Steps/s: 10.52 | Samples/s: 673.3
+Step 6300/50000 | Loss: 336.6872 | LR: 1.58e-04 | Steps/s: 9.56 | Samples/s: 611.8
+Step 6400/50000 | Loss: 335.3676 | LR: 1.60e-04 | Steps/s: 9.76 | Samples/s: 624.7
+Step 6500/50000 | Loss: 334.3439 | LR: 1.63e-04 | Steps/s: 10.40 | Samples/s: 665.5
+Step 6600/50000 | Loss: 334.7415 | LR: 1.65e-04 | Steps/s: 9.80 | Samples/s: 627.3
+Step 6700/50000 | Loss: 332.6230 | LR: 1.68e-04 | Steps/s: 10.18 | Samples/s: 651.4
+Step 6800/50000 | Loss: 331.0327 | LR: 1.70e-04 | Steps/s: 7.48 | Samples/s: 479.0
+Step 6900/50000 | Loss: 331.5889 | LR: 1.73e-04 | Steps/s: 9.60 | Samples/s: 614.5
+Step 7000/50000 | Loss: 330.8610 | LR: 1.75e-04 | Steps/s: 10.28 | Samples/s: 657.7
+Step 7100/50000 | Loss: 330.1903 | LR: 1.78e-04 | Steps/s: 9.73 | Samples/s: 622.6
+Step 7200/50000 | Loss: 328.3146 | LR: 1.80e-04 | Steps/s: 7.24 | Samples/s: 463.6
+Step 7300/50000 | Loss: 328.7283 | LR: 1.83e-04 | Steps/s: 10.03 | Samples/s: 642.2
+Step 7400/50000 | Loss: 328.5237 | LR: 1.85e-04 | Steps/s: 9.23 | Samples/s: 590.6
+Step 7500/50000 | Loss: 327.3040 | LR: 1.88e-04 | Steps/s: 9.85 | Samples/s: 630.2
+Step 7600/50000 | Loss: 325.5153 | LR: 1.90e-04 | Steps/s: 9.63 | Samples/s: 616.5
+Step 7700/50000 | Loss: 325.2022 | LR: 1.93e-04 | Steps/s: 9.61 | Samples/s: 614.8
+Step 7800/50000 | Loss: 323.4068 | LR: 1.95e-04 | Steps/s: 9.95 | Samples/s: 636.7
+Step 7900/50000 | Loss: 323.4664 | LR: 1.98e-04 | Steps/s: 9.19 | Samples/s: 588.1
+Step 8000/50000 | Loss: 323.1400 | LR: 2.00e-04 | Steps/s: 10.26 | Samples/s: 656.9
+Step 8100/50000 | Loss: 323.2985 | LR: 2.00e-04 | Steps/s: 10.53 | Samples/s: 674.1
+Step 8200/50000 | Loss: 321.1368 | LR: 2.00e-04 | Steps/s: 10.07 | Samples/s: 644.3
+Step 8300/50000 | Loss: 319.6938 | LR: 2.00e-04 | Steps/s: 10.43 | Samples/s: 667.7
+Step 8400/50000 | Loss: 321.6204 | LR: 2.00e-04 | Steps/s: 9.91 | Samples/s: 634.1
+Step 8500/50000 | Loss: 319.1166 | LR: 2.00e-04 | Steps/s: 9.79 | Samples/s: 626.4
+Step 8600/50000 | Loss: 319.4019 | LR: 2.00e-04 | Steps/s: 10.28 | Samples/s: 658.0
+Step 8700/50000 | Loss: 317.8175 | LR: 2.00e-04 | Steps/s: 10.23 | Samples/s: 655.0
+Step 8800/50000 | Loss: 318.3929 | LR: 2.00e-04 | Steps/s: 9.28 | Samples/s: 593.7
+Step 8900/50000 | Loss: 317.7529 | LR: 2.00e-04 | Steps/s: 9.85 | Samples/s: 630.2
+Step 9000/50000 | Loss: 316.4941 | LR: 2.00e-04 | Steps/s: 9.63 | Samples/s: 616.5
+Step 9100/50000 | Loss: 316.3224 | LR: 2.00e-04 | Steps/s: 9.96 | Samples/s: 637.1
+Step 9200/50000 | Loss: 314.9263 | LR: 2.00e-04 | Steps/s: 9.98 | Samples/s: 638.9
+Step 9300/50000 | Loss: 313.9454 | LR: 2.00e-04 | Steps/s: 9.18 | Samples/s: 587.8
+Step 9400/50000 | Loss: 316.0025 | LR: 2.00e-04 | Steps/s: 10.05 | Samples/s: 643.3
+Step 9500/50000 | Loss: 313.7587 | LR: 2.00e-04 | Steps/s: 10.33 | Samples/s: 661.4
+Step 9600/50000 | Loss: 313.8513 | LR: 2.00e-04 | Steps/s: 9.81 | Samples/s: 627.6
+Step 9700/50000 | Loss: 312.6451 | LR: 2.00e-04 | Steps/s: 9.82 | Samples/s: 628.8
+Step 9800/50000 | Loss: 312.4437 | LR: 2.00e-04 | Steps/s: 9.87 | Samples/s: 631.6
+Step 9900/50000 | Loss: 312.8116 | LR: 2.00e-04 | Steps/s: 9.43 | Samples/s: 603.3
+Step 10000/50000 | Loss: 313.0350 | LR: 2.00e-04 | Steps/s: 9.84 | Samples/s: 630.0
+Saved checkpoint to outputs/baseline/checkpoint-10000
+Step 10100/50000 | Loss: 312.7359 | LR: 2.00e-04 | Steps/s: 8.08 | Samples/s: 516.8
+Step 10200/50000 | Loss: 310.5182 | LR: 2.00e-04 | Steps/s: 9.70 | Samples/s: 621.0
+Step 10300/50000 | Loss: 311.5215 | LR: 2.00e-04 | Steps/s: 9.17 | Samples/s: 587.0
+Step 10400/50000 | Loss: 311.3801 | LR: 2.00e-04 | Steps/s: 9.34 | Samples/s: 597.7
+Step 10500/50000 | Loss: 310.7718 | LR: 2.00e-04 | Steps/s: 9.89 | Samples/s: 633.0
+Step 10600/50000 | Loss: 308.5229 | LR: 2.00e-04 | Steps/s: 10.03 | Samples/s: 641.8
+Step 10700/50000 | Loss: 308.8825 | LR: 2.00e-04 | Steps/s: 9.48 | Samples/s: 606.5
+Step 10800/50000 | Loss: 308.7286 | LR: 2.00e-04 | Steps/s: 10.30 | Samples/s: 659.2
+Step 10900/50000 | Loss: 308.1903 | LR: 2.00e-04 | Steps/s: 9.87 | Samples/s: 631.9
+Step 11000/50000 | Loss: 307.5309 | LR: 1.99e-04 | Steps/s: 9.96 | Samples/s: 637.2
+Step 11100/50000 | Loss: 306.7467 | LR: 1.99e-04 | Steps/s: 10.49 | Samples/s: 671.5
+Step 11200/50000 | Loss: 307.0114 | LR: 1.99e-04 | Steps/s: 9.58 | Samples/s: 612.9
+Step 11300/50000 | Loss: 307.2940 | LR: 1.99e-04 | Steps/s: 9.93 | Samples/s: 635.2
+Step 11400/50000 | Loss: 305.5296 | LR: 1.99e-04 | Steps/s: 10.42 | Samples/s: 667.0
+Step 11500/50000 | Loss: 306.1008 | LR: 1.99e-04 | Steps/s: 9.61 | Samples/s: 615.3
+Step 11600/50000 | Loss: 305.9254 | LR: 1.99e-04 | Steps/s: 10.42 | Samples/s: 667.0
+Step 11700/50000 | Loss: 304.8704 | LR: 1.99e-04 | Steps/s: 10.38 | Samples/s: 664.6
+Step 11800/50000 | Loss: 304.4279 | LR: 1.99e-04 | Steps/s: 9.93 | Samples/s: 635.5
+Step 11900/50000 | Loss: 305.4368 | LR: 1.99e-04 | Steps/s: 10.56 | Samples/s: 676.1
+Step 12000/50000 | Loss: 303.9310 | LR: 1.99e-04 | Steps/s: 9.61 | Samples/s: 614.8
+Step 12100/50000 | Loss: 303.4899 | LR: 1.99e-04 | Steps/s: 10.53 | Samples/s: 674.2
+Step 12200/50000 | Loss: 304.2082 | LR: 1.99e-04 | Steps/s: 9.98 | Samples/s: 638.9
+Step 12300/50000 | Loss: 303.4810 | LR: 1.99e-04 | Steps/s: 9.67 | Samples/s: 618.6
+Step 12400/50000 | Loss: 302.4132 | LR: 1.99e-04 | Steps/s: 10.19 | Samples/s: 652.1
+Step 12500/50000 | Loss: 301.3087 | LR: 1.99e-04 | Steps/s: 10.04 | Samples/s: 642.3
+Step 12600/50000 | Loss: 301.8572 | LR: 1.99e-04 | Steps/s: 10.00 | Samples/s: 639.9
+Step 12700/50000 | Loss: 301.0298 | LR: 1.99e-04 | Steps/s: 9.67 | Samples/s: 619.1
+Step 12800/50000 | Loss: 301.5833 | LR: 1.99e-04 | Steps/s: 9.79 | Samples/s: 626.7
+Step 12900/50000 | Loss: 301.4850 | LR: 1.99e-04 | Steps/s: 9.34 | Samples/s: 597.7
+Step 13000/50000 | Loss: 300.7044 | LR: 1.99e-04 | Steps/s: 10.22 | Samples/s: 654.0
+Step 13100/50000 | Loss: 300.7657 | LR: 1.98e-04 | Steps/s: 9.81 | Samples/s: 627.9
+Step 13200/50000 | Loss: 299.9844 | LR: 1.98e-04 | Steps/s: 10.02 | Samples/s: 641.6
+Step 13300/50000 | Loss: 299.6866 | LR: 1.98e-04 | Steps/s: 10.30 | Samples/s: 659.2
+Step 13400/50000 | Loss: 299.4952 | LR: 1.98e-04 | Steps/s: 9.52 | Samples/s: 609.3
+Step 13500/50000 | Loss: 299.2852 | LR: 1.98e-04 | Steps/s: 9.83 | Samples/s: 629.1
+Step 13600/50000 | Loss: 298.9537 | LR: 1.98e-04 | Steps/s: 10.16 | Samples/s: 650.3
+Step 13700/50000 | Loss: 298.4551 | LR: 1.98e-04 | Steps/s: 10.23 | Samples/s: 654.8
+Step 13800/50000 | Loss: 297.7460 | LR: 1.98e-04 | Steps/s: 10.50 | Samples/s: 672.2
+Step 13900/50000 | Loss: 298.3348 | LR: 1.98e-04 | Steps/s: 9.88 | Samples/s: 632.0
+Step 14000/50000 | Loss: 298.4445 | LR: 1.98e-04 | Steps/s: 10.05 | Samples/s: 643.1
+Step 14100/50000 | Loss: 298.1417 | LR: 1.98e-04 | Steps/s: 10.22 | Samples/s: 653.9
+Step 14200/50000 | Loss: 296.3941 | LR: 1.98e-04 | Steps/s: 10.66 | Samples/s: 682.5
+Step 14300/50000 | Loss: 297.2162 | LR: 1.98e-04 | Steps/s: 10.26 | Samples/s: 656.4
+Step 14400/50000 | Loss: 297.3405 | LR: 1.98e-04 | Steps/s: 10.23 | Samples/s: 655.0
+Step 14500/50000 | Loss: 297.1281 | LR: 1.98e-04 | Steps/s: 10.22 | Samples/s: 653.9
+Step 14600/50000 | Loss: 298.7823 | LR: 1.97e-04 | Steps/s: 9.33 | Samples/s: 596.8
+Step 14700/50000 | Loss: 297.1863 | LR: 1.97e-04 | Steps/s: 10.21 | Samples/s: 653.8
+Step 14800/50000 | Loss: 296.0203 | LR: 1.97e-04 | Steps/s: 10.15 | Samples/s: 649.7
+Step 14900/50000 | Loss: 295.6086 | LR: 1.97e-04 | Steps/s: 10.00 | Samples/s: 640.0
+Step 15000/50000 | Loss: 296.3972 | LR: 1.97e-04 | Steps/s: 10.02 | Samples/s: 641.6
+Saved checkpoint to outputs/baseline/checkpoint-15000
+Step 15100/50000 | Loss: 296.3038 | LR: 1.97e-04 | Steps/s: 8.72 | Samples/s: 558.0
+Step 15200/50000 | Loss: 294.7974 | LR: 1.97e-04 | Steps/s: 10.20 | Samples/s: 653.1
+Step 15300/50000 | Loss: 295.1473 | LR: 1.97e-04 | Steps/s: 10.85 | Samples/s: 694.4
+Step 15400/50000 | Loss: 294.9131 | LR: 1.97e-04 | Steps/s: 10.53 | Samples/s: 674.0
+Step 15500/50000 | Loss: 294.7691 | LR: 1.97e-04 | Steps/s: 10.56 | Samples/s: 675.7
+Step 15600/50000 | Loss: 295.2177 | LR: 1.97e-04 | Steps/s: 9.97 | Samples/s: 638.3
+Step 15700/50000 | Loss: 294.8512 | LR: 1.97e-04 | Steps/s: 10.00 | Samples/s: 640.2
+Step 15800/50000 | Loss: 293.6576 | LR: 1.96e-04 | Steps/s: 10.49 | Samples/s: 671.6
+Step 15900/50000 | Loss: 293.5224 | LR: 1.96e-04 | Steps/s: 10.02 | Samples/s: 641.6
+Step 16000/50000 | Loss: 295.2500 | LR: 1.96e-04 | Steps/s: 9.34 | Samples/s: 597.6
+Step 16100/50000 | Loss: 293.7903 | LR: 1.96e-04 | Steps/s: 10.34 | Samples/s: 661.7
+Step 16200/50000 | Loss: 292.7013 | LR: 1.96e-04 | Steps/s: 9.94 | Samples/s: 636.1
+Step 16300/50000 | Loss: 292.5767 | LR: 1.96e-04 | Steps/s: 9.98 | Samples/s: 638.5
+Step 16400/50000 | Loss: 292.2071 | LR: 1.96e-04 | Steps/s: 10.21 | Samples/s: 653.5
+Step 16500/50000 | Loss: 292.6199 | LR: 1.96e-04 | Steps/s: 10.66 | Samples/s: 682.1
+Step 16600/50000 | Loss: 293.2360 | LR: 1.96e-04 | Steps/s: 10.38 | Samples/s: 664.0
+Step 16700/50000 | Loss: 292.6201 | LR: 1.96e-04 | Steps/s: 10.45 | Samples/s: 668.5
+Step 16800/50000 | Loss: 290.9502 | LR: 1.96e-04 | Steps/s: 10.30 | Samples/s: 658.9
+Step 16900/50000 | Loss: 291.7685 | LR: 1.95e-04 | Steps/s: 10.55 | Samples/s: 674.9
+Step 17000/50000 | Loss: 291.3492 | LR: 1.95e-04 | Steps/s: 9.82 | Samples/s: 628.5
+Step 17100/50000 | Loss: 291.2291 | LR: 1.95e-04 | Steps/s: 9.82 | Samples/s: 628.8
+Step 17200/50000 | Loss: 291.8130 | LR: 1.95e-04 | Steps/s: 9.63 | Samples/s: 616.3
+Step 17300/50000 | Loss: 291.4584 | LR: 1.95e-04 | Steps/s: 10.50 | Samples/s: 672.1
+Step 17400/50000 | Loss: 291.1395 | LR: 1.95e-04 | Steps/s: 10.23 | Samples/s: 654.7
+Step 17500/50000 | Loss: 291.5807 | LR: 1.95e-04 | Steps/s: 10.01 | Samples/s: 640.4
+Step 17600/50000 | Loss: 291.5449 | LR: 1.95e-04 | Steps/s: 10.20 | Samples/s: 652.5
+Step 17700/50000 | Loss: 290.7823 | LR: 1.95e-04 | Steps/s: 10.31 | Samples/s: 660.1
+Step 17800/50000 | Loss: 290.4261 | LR: 1.94e-04 | Steps/s: 10.16 | Samples/s: 649.9
+Step 17900/50000 | Loss: 289.4565 | LR: 1.94e-04 | Steps/s: 10.20 | Samples/s: 652.6
+Step 18000/50000 | Loss: 290.7969 | LR: 1.94e-04 | Steps/s: 10.40 | Samples/s: 665.4
+Step 18100/50000 | Loss: 289.8262 | LR: 1.94e-04 | Steps/s: 9.55 | Samples/s: 611.5
+Step 18200/50000 | Loss: 290.2646 | LR: 1.94e-04 | Steps/s: 9.93 | Samples/s: 635.6
+Step 18300/50000 | Loss: 289.8088 | LR: 1.94e-04 | Steps/s: 9.60 | Samples/s: 614.7
+Step 18400/50000 | Loss: 289.3293 | LR: 1.94e-04 | Steps/s: 9.79 | Samples/s: 626.6
+Step 18500/50000 | Loss: 288.9095 | LR: 1.94e-04 | Steps/s: 10.11 | Samples/s: 647.0
+Step 18600/50000 | Loss: 289.9665 | LR: 1.94e-04 | Steps/s: 9.92 | Samples/s: 634.8
+Step 18700/50000 | Loss: 288.5536 | LR: 1.93e-04 | Steps/s: 10.45 | Samples/s: 668.8
+Step 18800/50000 | Loss: 287.6873 | LR: 1.93e-04 | Steps/s: 10.32 | Samples/s: 660.2
+Step 18900/50000 | Loss: 288.6039 | LR: 1.93e-04 | Steps/s: 10.23 | Samples/s: 654.9
+Step 19000/50000 | Loss: 288.5817 | LR: 1.93e-04 | Steps/s: 10.36 | Samples/s: 663.0
+Step 19100/50000 | Loss: 287.7382 | LR: 1.93e-04 | Steps/s: 10.43 | Samples/s: 667.7
+Step 19200/50000 | Loss: 287.7464 | LR: 1.93e-04 | Steps/s: 10.39 | Samples/s: 664.7
+Step 19300/50000 | Loss: 288.9131 | LR: 1.93e-04 | Steps/s: 10.58 | Samples/s: 676.9
+Step 19400/50000 | Loss: 287.4097 | LR: 1.93e-04 | Steps/s: 10.61 | Samples/s: 678.8
+Step 19500/50000 | Loss: 288.4057 | LR: 1.92e-04 | Steps/s: 10.94 | Samples/s: 700.3
+Step 19600/50000 | Loss: 288.3583 | LR: 1.92e-04 | Steps/s: 10.51 | Samples/s: 672.4
+Step 19700/50000 | Loss: 287.4333 | LR: 1.92e-04 | Steps/s: 10.46 | Samples/s: 669.6
+Step 19800/50000 | Loss: 287.0366 | LR: 1.92e-04 | Steps/s: 10.38 | Samples/s: 664.1
+Step 19900/50000 | Loss: 287.2306 | LR: 1.92e-04 | Steps/s: 10.74 | Samples/s: 687.2
+Step 20000/50000 | Loss: 287.3722 | LR: 1.92e-04 | Steps/s: 10.68 | Samples/s: 683.4
+Saved checkpoint to outputs/baseline/checkpoint-20000
+Removed old checkpoint: outputs/baseline/checkpoint-5000
+Step 20100/50000 | Loss: 287.1596 | LR: 1.92e-04 | Steps/s: 9.53 | Samples/s: 610.0
+Step 20200/50000 | Loss: 285.7036 | LR: 1.91e-04 | Steps/s: 10.92 | Samples/s: 699.1
+Step 20300/50000 | Loss: 286.2974 | LR: 1.91e-04 | Steps/s: 10.48 | Samples/s: 670.8
+Step 20400/50000 | Loss: 289.8323 | LR: 1.91e-04 | Steps/s: 10.59 | Samples/s: 677.9
+Step 20500/50000 | Loss: 287.0834 | LR: 1.91e-04 | Steps/s: 10.61 | Samples/s: 679.0
+Step 20600/50000 | Loss: 285.7318 | LR: 1.91e-04 | Steps/s: 10.97 | Samples/s: 702.1
+Step 20700/50000 | Loss: 286.7376 | LR: 1.91e-04 | Steps/s: 10.49 | Samples/s: 671.4
+Step 20800/50000 | Loss: 286.6013 | LR: 1.91e-04 | Steps/s: 10.16 | Samples/s: 650.2

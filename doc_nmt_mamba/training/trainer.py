@@ -6,6 +6,8 @@ H100-optimized training with:
 - torch.compile for kernel fusion
 - Gradient checkpointing for long sequences
 - Efficient logging and checkpointing
+- Multi-GPU support (DDP/FSDP)
+- NVLink-optimized NCCL backend
 """
 
 import os
@@ -16,11 +18,21 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.cuda.amp import autocast
 
 from .objectives import create_loss_fn
 from .schedulers import create_scheduler
+from .distributed import (
+    DistributedConfig,
+    setup_distributed,
+    cleanup_distributed,
+    wrap_model_distributed,
+    print_distributed_info,
+    all_reduce_mean,
+    barrier,
+)
 
 
 @dataclass
@@ -64,6 +76,14 @@ class TrainerConfig:
     # H100 optimizations
     tf32_matmul: bool = True
     cudnn_benchmark: bool = True
+    channels_last: bool = True  # Use channels-last memory format
+
+    # Distributed training
+    distributed_strategy: str = "ddp"  # "none", "ddp", "fsdp", "fsdp_full"
+    find_unused_parameters: bool = False
+    static_graph: bool = True
+    fsdp_sharding: str = "full_shard"
+    fsdp_cpu_offload: bool = False
 
 
 class Trainer:
@@ -75,6 +95,8 @@ class Trainer:
     - torch.compile for kernel optimization
     - Gradient checkpointing for 8K sequences
     - Efficient checkpoint management
+    - Multi-GPU DDP/FSDP support
+    - NVLink-optimized communication
     """
 
     def __init__(
@@ -99,20 +121,41 @@ class Trainer:
         self.eval_dataloader = eval_dataloader
         self.eval_fn = eval_fn
 
-        # Setup device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Setup distributed training
+        self.dist_info = setup_distributed()
+        self.device = self.dist_info["device"]
+        self.is_main = self.dist_info["is_main"]
+        self.world_size = self.dist_info["world_size"]
+
+        # Print distributed info (main process only)
+        print_distributed_info(self.dist_info)
 
         # Apply H100 optimizations
         self._setup_h100_optimizations()
 
-        # Move model to device
-        self.model = self.model.to(self.device)
-
-        # Enable gradient checkpointing
-        if self.config.gradient_checkpointing:
+        # Enable gradient checkpointing before wrapping
+        if self.config.gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
             self.model.gradient_checkpointing_enable()
 
-        # Compile model
+        # Wrap model for distributed training
+        if self.world_size > 1:
+            dist_config = DistributedConfig(
+                strategy=self.config.distributed_strategy,
+                find_unused_parameters=self.config.find_unused_parameters,
+                static_graph=self.config.static_graph,
+                sharding_strategy=self.config.fsdp_sharding,
+                cpu_offload=self.config.fsdp_cpu_offload,
+            )
+            self.model = wrap_model_distributed(
+                self.model,
+                dist_config,
+                self.device,
+                use_bf16=self.config.use_bf16,
+            )
+        else:
+            self.model = self.model.to(self.device)
+
+        # Compile model (after DDP wrapping for compatibility)
         if self.config.use_compile:
             self.model = torch.compile(self.model, mode=self.config.compile_mode)
 
@@ -140,9 +183,11 @@ class Trainer:
         self.epoch = 0
         self.best_metric = float("inf")
 
-        # Output directory
+        # Output directory (main process only creates)
         self.output_dir = Path(self.config.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if self.is_main:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+        barrier()  # Wait for directory creation
 
     def _setup_h100_optimizations(self):
         """Setup H100-specific optimizations."""
@@ -180,12 +225,16 @@ class Trainer:
         )
 
     def train(self):
-        """Main training loop."""
+        """Main training loop with distributed support."""
         self.model.train()
 
         data_iter = iter(self.train_dataloader)
         accumulated_loss = 0.0
         step_start_time = time.time()
+
+        # Set epoch for distributed sampler if applicable
+        if hasattr(self.train_dataloader, 'sampler') and hasattr(self.train_dataloader.sampler, 'set_epoch'):
+            self.train_dataloader.sampler.set_epoch(self.epoch)
 
         while self.global_step < self.config.max_steps:
             # Get batch
@@ -193,11 +242,14 @@ class Trainer:
                 batch = next(data_iter)
             except StopIteration:
                 self.epoch += 1
+                # Update sampler epoch for proper shuffling
+                if hasattr(self.train_dataloader, 'sampler') and hasattr(self.train_dataloader.sampler, 'set_epoch'):
+                    self.train_dataloader.sampler.set_epoch(self.epoch)
                 data_iter = iter(self.train_dataloader)
                 batch = next(data_iter)
 
             # Move to device
-            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            batch = {k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
             # Forward pass with autocast
             with autocast(dtype=torch.bfloat16, enabled=self.config.use_bf16):
@@ -223,18 +275,26 @@ class Trainer:
 
             self.global_step += 1
 
-            # Logging
+            # Logging (main process only)
             if self.global_step % self.config.log_steps == 0:
-                elapsed = time.time() - step_start_time
-                steps_per_sec = self.config.log_steps / elapsed
-                lr = self.scheduler.get_last_lr()[0]
+                # Average loss across processes
+                if self.world_size > 1:
+                    loss_tensor = torch.tensor(accumulated_loss, device=self.device)
+                    accumulated_loss = all_reduce_mean(loss_tensor).item()
 
-                print(
-                    f"Step {self.global_step}/{self.config.max_steps} | "
-                    f"Loss: {accumulated_loss:.4f} | "
-                    f"LR: {lr:.2e} | "
-                    f"Steps/s: {steps_per_sec:.2f}"
-                )
+                if self.is_main:
+                    elapsed = time.time() - step_start_time
+                    steps_per_sec = self.config.log_steps / elapsed
+                    samples_per_sec = steps_per_sec * self.config.batch_size * self.world_size
+                    lr = self.scheduler.get_last_lr()[0]
+
+                    print(
+                        f"Step {self.global_step}/{self.config.max_steps} | "
+                        f"Loss: {accumulated_loss:.4f} | "
+                        f"LR: {lr:.2e} | "
+                        f"Steps/s: {steps_per_sec:.2f} | "
+                        f"Samples/s: {samples_per_sec:.1f}"
+                    )
 
                 accumulated_loss = 0.0
                 step_start_time = time.time()
@@ -243,11 +303,15 @@ class Trainer:
             if self.global_step % self.config.eval_steps == 0 and self.eval_fn:
                 self._evaluate()
 
-            # Checkpointing
+            # Checkpointing (main process only)
             if self.global_step % self.config.save_steps == 0:
                 self._save_checkpoint()
 
-        print(f"Training complete! Final step: {self.global_step}")
+        if self.is_main:
+            print(f"Training complete! Final step: {self.global_step}")
+
+        # Cleanup distributed
+        cleanup_distributed()
 
     def _training_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Single training step."""
@@ -375,7 +439,7 @@ class Trainer:
         return loss
 
     def _evaluate(self):
-        """Run evaluation."""
+        """Run evaluation (main process only for logging)."""
         if self.eval_fn is None or self.eval_dataloader is None:
             return
 
@@ -383,23 +447,37 @@ class Trainer:
         metrics = self.eval_fn(self.model, self.eval_dataloader, self.device)
         self.model.train()
 
-        print(f"Eval @ step {self.global_step}: {metrics}")
+        if self.is_main:
+            print(f"Eval @ step {self.global_step}: {metrics}")
 
-        # Track best metric
-        if "loss" in metrics and metrics["loss"] < self.best_metric:
-            self.best_metric = metrics["loss"]
-            self._save_checkpoint("best")
+            # Track best metric
+            if "loss" in metrics and metrics["loss"] < self.best_metric:
+                self.best_metric = metrics["loss"]
+                self._save_checkpoint("best")
+
+        barrier()  # Sync after evaluation
 
     def _save_checkpoint(self, name: Optional[str] = None):
-        """Save training checkpoint."""
+        """Save training checkpoint (main process only)."""
+        if not self.is_main:
+            barrier()  # Wait for main process
+            return
+
         if name is None:
             name = f"checkpoint-{self.global_step}"
 
         checkpoint_dir = self.output_dir / name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save model state
-        model_to_save = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+        # Get underlying model from wrappers (DDP/FSDP/compile)
+        model_to_save = self.model
+        # Unwrap torch.compile
+        if hasattr(model_to_save, "_orig_mod"):
+            model_to_save = model_to_save._orig_mod
+        # Unwrap DDP
+        if hasattr(model_to_save, "module"):
+            model_to_save = model_to_save.module
+
         torch.save(model_to_save.state_dict(), checkpoint_dir / "model.pt")
 
         # Save optimizer and scheduler
@@ -410,6 +488,7 @@ class Trainer:
                 "global_step": self.global_step,
                 "epoch": self.epoch,
                 "best_metric": self.best_metric,
+                "world_size": self.world_size,
             },
             checkpoint_dir / "training_state.pt",
         )
@@ -418,6 +497,8 @@ class Trainer:
 
         # Cleanup old checkpoints
         self._cleanup_checkpoints()
+
+        barrier()  # Sync after saving
 
     def _cleanup_checkpoints(self):
         """Remove old checkpoints to respect save_total_limit."""

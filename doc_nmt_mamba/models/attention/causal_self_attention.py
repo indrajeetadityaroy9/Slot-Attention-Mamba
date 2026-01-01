@@ -3,17 +3,64 @@ Causal Self-Attention with RoPE for decoder.
 
 Supports KV caching for efficient autoregressive generation.
 Supports VarLen mode for packed sequence training (20-30% H100 speedup).
+Supports fallback to PyTorch SDPA when flash-attn is not available.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Tuple
 
-from flash_attn import flash_attn_func
-from flash_attn import flash_attn_varlen_func
+# Try to import flash_attn, fallback to PyTorch SDPA if not available
+try:
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+    flash_attn_func = None
+    flash_attn_varlen_func = None
 
 from ..mamba2.norms import RMSNorm
 from .rope import RotaryPositionalEmbedding
+
+
+def sdpa_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float = 0.0,
+    causal: bool = False,
+    training: bool = True,
+) -> torch.Tensor:
+    """
+    PyTorch native scaled dot-product attention fallback.
+
+    Args:
+        q: Query tensor (batch, seq_len, n_heads, head_dim)
+        k: Key tensor (batch, seq_len, n_heads, head_dim)
+        v: Value tensor (batch, seq_len, n_heads, head_dim)
+        dropout_p: Dropout probability
+        causal: Whether to apply causal mask
+        training: Whether in training mode
+
+    Returns:
+        Output tensor (batch, seq_len, n_heads, head_dim)
+    """
+    # Transpose to (batch, n_heads, seq_len, head_dim) for SDPA
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    # Use PyTorch's optimized SDPA (uses Flash or Memory-efficient automatically)
+    out = F.scaled_dot_product_attention(
+        q, k, v,
+        attn_mask=None,
+        dropout_p=dropout_p if training else 0.0,
+        is_causal=causal,
+    )
+
+    # Transpose back to (batch, seq_len, n_heads, head_dim)
+    return out.transpose(1, 2)
 
 
 class CausalSelfAttention(nn.Module):
@@ -113,18 +160,33 @@ class CausalSelfAttention(nn.Module):
             # Note: RoPE in packed mode requires per-sequence position computation
             # Skipping RoPE for packed training mode (Mamba handles positions anyway)
 
-            # FlashAttention-2 VarLen with causal mask
-            out = flash_attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                dropout_p=self.dropout if self.training else 0.0,
-                causal=True,
-            )
+            if FLASH_ATTN_AVAILABLE:
+                # FlashAttention-2 VarLen with causal mask
+                out = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    causal=True,
+                )
+            else:
+                # Fallback: unpack sequences and use PyTorch SDPA
+                # This is less efficient but works without flash_attn
+                batch_size = cu_seqlens.size(0) - 1
+                outputs = []
+                for i in range(batch_size):
+                    start, end = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+                    seq_len = end - start
+                    q_i = q[start:end].unsqueeze(0)  # (1, seq_len, n_heads, head_dim)
+                    k_i = k[start:end].unsqueeze(0)
+                    v_i = v[start:end].unsqueeze(0)
+                    out_i = sdpa_attention(q_i, k_i, v_i, self.dropout, causal=True, training=self.training)
+                    outputs.append(out_i.squeeze(0))
+                out = torch.cat(outputs, dim=0)
 
             # Reshape and project output
             out = out.view(total_tokens, self.d_model)
@@ -159,14 +221,23 @@ class CausalSelfAttention(nn.Module):
                     v = torch.cat([value_cache, v], dim=1)
             new_kv_cache = (k, v)
 
-            # FlashAttention-2 with causal mask
-            out = flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=self.dropout if self.training else 0.0,
-                causal=True,
-            )
+            if FLASH_ATTN_AVAILABLE:
+                # FlashAttention-2 with causal mask
+                out = flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    causal=True,
+                )
+            else:
+                # PyTorch SDPA fallback
+                out = sdpa_attention(
+                    q, k, v,
+                    dropout_p=self.dropout,
+                    causal=True,
+                    training=self.training,
+                )
 
             # Reshape and project output
             out = out.view(B, T, self.d_model)

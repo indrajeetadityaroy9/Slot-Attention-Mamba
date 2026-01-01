@@ -1,6 +1,7 @@
 # IWSLT 2014 German-English configuration
 
 name: iwslt14_de_en
+dataset_name: iwslt14
 
 # Tokenizer settings
 # CRITICAL: Use "custom" for thesis work (32K vocab = proper parameter allocation)
@@ -24,6 +25,10 @@ p_concat: 0.5  # 50% single, 50% concatenated
 # Packed mode eliminates padding waste and is 20-30% faster on H100
 collator_mode: packed
 
-# Data loading
-num_workers: 8
-prefetch_factor: 4
+# Data loading - Optimized for 52-core Xeon with 2x H100
+# More workers = faster data loading, but diminishing returns past ~24
+num_workers: 16  # Increased from 8 (52 CPU cores available)
+prefetch_factor: 4  # Prefetch 4 batches per worker
+persistent_workers: true  # Keep workers alive between epochs
+pin_memory: true  # Pin memory for faster GPU transfer
+drop_last: false  # Keep all samples

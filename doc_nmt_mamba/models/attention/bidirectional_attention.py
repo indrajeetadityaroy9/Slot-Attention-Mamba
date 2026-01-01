@@ -3,17 +3,26 @@ Bidirectional Attention for encoder.
 
 Uses full attention (causal=False) since encoder sees entire sequence.
 Supports VarLen mode for packed sequence training (20-30% H100 speedup).
+Supports fallback to PyTorch SDPA when flash-attn is not available.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional
 
-from flash_attn import flash_attn_func
-from flash_attn import flash_attn_varlen_func
+# Try to import flash_attn, fallback to PyTorch SDPA if not available
+try:
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+    flash_attn_func = None
+    flash_attn_varlen_func = None
 
 from ..mamba2.norms import RMSNorm
 from .rope import RotaryPositionalEmbedding
+from .causal_self_attention import sdpa_attention
 
 
 class BidirectionalAttention(nn.Module):
@@ -104,22 +113,33 @@ class BidirectionalAttention(nn.Module):
             q, k, v = qkv.unbind(dim=1)  # Each: (total_tokens, n_heads, head_dim)
 
             # Note: RoPE in packed mode requires per-sequence position computation
-            # For now, we apply position within each packed segment
-            # TODO: Implement proper per-sequence RoPE for packed mode
             # Skipping RoPE for packed mode (Mamba handles positions anyway)
 
-            # FlashAttention-2 VarLen: expects (total_tokens, n_heads, head_dim)
-            out = flash_attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                dropout_p=self.dropout if self.training else 0.0,
-                causal=False,
-            )
+            if FLASH_ATTN_AVAILABLE:
+                # FlashAttention-2 VarLen: expects (total_tokens, n_heads, head_dim)
+                out = flash_attn_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    causal=False,
+                )
+            else:
+                # Fallback: unpack sequences and use PyTorch SDPA
+                batch_size = cu_seqlens.size(0) - 1
+                outputs = []
+                for i in range(batch_size):
+                    start, end = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+                    q_i = q[start:end].unsqueeze(0)
+                    k_i = k[start:end].unsqueeze(0)
+                    v_i = v[start:end].unsqueeze(0)
+                    out_i = sdpa_attention(q_i, k_i, v_i, self.dropout, causal=False, training=self.training)
+                    outputs.append(out_i.squeeze(0))
+                out = torch.cat(outputs, dim=0)
 
             # Reshape and project output
             out = out.view(total_tokens, self.d_model)
@@ -146,14 +166,23 @@ class BidirectionalAttention(nn.Module):
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
 
-            # FlashAttention-2 with NO causal mask (bidirectional)
-            out = flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=self.dropout if self.training else 0.0,
-                causal=False,
-            )
+            if FLASH_ATTN_AVAILABLE:
+                # FlashAttention-2 with NO causal mask (bidirectional)
+                out = flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    causal=False,
+                )
+            else:
+                # PyTorch SDPA fallback
+                out = sdpa_attention(
+                    q, k, v,
+                    dropout_p=self.dropout,
+                    causal=False,
+                    training=self.training,
+                )
 
             # Reshape and project output
             out = out.view(B, T, self.d_model)

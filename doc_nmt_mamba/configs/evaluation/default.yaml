@@ -1,0 +1,54 @@
+# Default evaluation configuration
+
+# Output settings
+output_dir: experiments/results
+experiment_name: evaluation
+
+# Quality evaluation
+quality:
+  enabled: true
+  metrics:
+    - bleu
+    - comet
+    - chrf
+  comet_model: Unbabel/wmt22-comet-da
+  bootstrap_samples: 1000
+  confidence_level: 0.95
+  batch_size: 16
+  max_length: 256
+
+# Efficiency evaluation
+efficiency:
+  enabled: true
+  seq_lengths: [512, 1024, 2048, 4096, 8192, 16384]
+  batch_sizes: [1, 8, 32]
+  max_new_tokens: 128
+  warmup_runs: 3
+  benchmark_runs: 20
+
+# ContraPro evaluation
+contrapro:
+  enabled: true
+  data_path: data/contrapro/contrapro.json
+  use_synthetic: false
+  max_samples: null
+  max_distance: 2048
+
+# Dataset settings
+dataset:
+  name: iwslt14
+  split: test
+  src_lang: de
+  tgt_lang: en
+
+# Tokenizer
+tokenizer:
+  type: custom
+  path: data/tokenizer/tokenizer.json
+
+# Significance testing
+significance:
+  enabled: true
+  method: paired_bootstrap
+  alpha: 0.05
+  num_samples: 1000

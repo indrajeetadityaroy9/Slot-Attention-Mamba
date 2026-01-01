@@ -1,0 +1,5 @@
+- training=debug
+- model=small
+- training.batch_size=4
+- training.max_steps=10
+- training.log_steps=2
