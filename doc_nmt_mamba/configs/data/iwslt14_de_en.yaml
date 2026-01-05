@@ -25,10 +25,10 @@ p_concat: 0.5  # 50% single, 50% concatenated
 # Packed mode eliminates padding waste and is 20-30% faster on H100
 collator_mode: packed
 
-# Data loading - Optimized for 52-core Xeon with 2x H100
+# Data loading - Optimized for 26-core Xeon with 1x H100 80GB
 # More workers = faster data loading, but diminishing returns past ~24
-num_workers: 16  # Increased from 8 (52 CPU cores available)
-prefetch_factor: 4  # Prefetch 4 batches per worker
+num_workers: 20  # Use 20 of 26 cores (leave headroom for GPU/OS)
+prefetch_factor: 8  # Aggressive prefetch with 221GB RAM
 persistent_workers: true  # Keep workers alive between epochs
 pin_memory: true  # Pin memory for faster GPU transfer
 drop_last: false  # Keep all samples

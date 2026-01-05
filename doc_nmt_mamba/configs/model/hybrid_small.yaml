@@ -6,14 +6,14 @@ name: small
 # Architecture
 encoder_layers: 6
 decoder_layers: 6
-d_model: 384
+d_model: 256       # Fixed: 256 → n_heads=8 (8-aligned for H100 kernels)
 d_state: 64
 d_conv: 4
 expand: 2
 
 # Attention configuration (1:7 ratio)
 attention_ratio: 0.125
-n_heads: 6
+n_heads: 4         # Fixed: 256/64=4 heads (matches d_model reduction)
 head_dim: 64
 cross_attn_every: 4
 

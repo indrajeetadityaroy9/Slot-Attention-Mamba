@@ -45,6 +45,11 @@ pip install -e ".[cpu]"  # comet, spacy, viz, etc.
 Virtual environment: `venv/` (Python 3.10.11)
 Requires CUDA 12.1+ for Mamba-2 kernels. FlashAttention-2 has PyTorch SDPA fallback.
 
+### Verify Installation
+```bash
+python verify_env.py  # Check all dependencies and CUDA availability
+```
+
 ## Commands
 
 ### Testing
@@ -74,10 +79,11 @@ mypy doc_nmt_mamba/           # Type checking
 # Single GPU (defaults to medium model - 200M params)
 python doc_nmt_mamba/scripts/train.py
 
-# With specific model size
-python doc_nmt_mamba/scripts/train.py model=medium    # 200M params (primary)
-python doc_nmt_mamba/scripts/train.py model=small     # 25M params (debugging)
-python doc_nmt_mamba/scripts/train.py model=base      # 77M params
+# With specific model size (model=hybrid_<size>)
+python doc_nmt_mamba/scripts/train.py model=hybrid_small   # 25M params (debugging)
+python doc_nmt_mamba/scripts/train.py model=hybrid_base    # 77M params
+python doc_nmt_mamba/scripts/train.py model=hybrid_medium  # 200M params (primary)
+python doc_nmt_mamba/scripts/train.py model=hybrid_large   # 400M params (scaling)
 
 # Multi-GPU DDP
 torchrun --nproc_per_node=2 doc_nmt_mamba/scripts/train.py
@@ -93,6 +99,12 @@ python doc_nmt_mamba/scripts/train.py data=opus_books model.dropout=0.2
 nmt-train                     # Same as python doc_nmt_mamba/scripts/train.py
 nmt-evaluate                  # Run evaluation
 nmt-build-tokenizer           # Build tokenizer
+
+# ICML/NeurIPS Experiment Configs (use experiment= override)
+python doc_nmt_mamba/scripts/train.py experiment=main_iwslt_hybrid    # Table 1: Main results
+python doc_nmt_mamba/scripts/train.py experiment=main_opus_hybrid     # OPUS-Books evaluation
+python doc_nmt_mamba/scripts/train.py experiment=ablation_no_hybrid_layer0  # Ablation: no layer-0 HYBRID
+python doc_nmt_mamba/scripts/train.py experiment=mqar_state_sweep     # MQAR synthetic benchmark
 ```
 
 ### Evaluation
@@ -114,6 +126,15 @@ python doc_nmt_mamba/scripts/benchmark_hardware.py
 ```
 
 ## Architecture
+
+### Model Sizes
+
+| Model   | Params | Enc/Dec Layers | d_model | d_state | HYBRID layers          |
+|---------|--------|----------------|---------|---------|------------------------|
+| small   | 25M    | 6/6            | 384     | 64      | [0, 4] (interval=4)    |
+| base    | 77M    | 12/12          | 512     | 64      | [0, 4, 8] (interval=4) |
+| medium  | 200M   | 16/16          | 768     | 128     | [0, 8] (interval=8)    |
+| large   | 400M   | 24/24          | 1024    | 128     | [0, 8, 16] (interval=8)|
 
 ### Hybrid Design (1:8 Ratio with HYBRID Blocks)
 
@@ -137,20 +158,23 @@ x = x + CrossAttn(RMSNorm(x), enc)  # Source-aligned output
 ```
 doc_nmt_mamba/
 ├── models/
-│   ├── layers.py           # All layer components:
-│   │                       #   RMSNorm, Mamba2BlockWrapper, BiMambaBlock,
-│   │                       #   segment_aware_flip, FlashCrossAttention,
-│   │                       #   CausalSelfAttention, BidirectionalAttention, RoPE
-│   ├── modeling_hybrid.py  # Full architecture:
-│   │                       #   HybridBlock, HybridBiMambaEncoder, HybridMambaDecoder,
-│   │                       #   HybridMambaEncoderDecoder, ModelConfig
-│   └── cache_utils.py      # MambaState, AttentionKVCache for inference
+│   ├── align_mamba.py      # NOVEL contributions (import from here):
+│   │                       #   LayerType, HybridBlock, HybridBiMambaEncoder,
+│   │                       #   HybridMambaDecoder, MambaState, AttentionKVCache
+│   ├── encoder_decoder.py  # Full model + config:
+│   │                       #   ModelConfig, HybridMambaEncoderDecoder
+│   ├── modeling_hybrid.py  # Proxy for backward compat (re-exports above)
+│   ├── components/         # Shared components:
+│   │   ├── attention.py    #   BidirectionalAttention, FlashCrossAttention
+│   │   └── normalization.py#   RMSNorm
+│   └── mamba/              # Mamba wrappers:
+│       ├── wrapper.py      #   Mamba2BlockWrapper
+│       └── bimamba.py      #   BiMambaBlock, segment_aware_flip
 ├── data/
-│   ├── synthetic.py        # MQARDataset for state capacity testing
-│   ├── augmentation.py     # ConcatenationAugmenter (CAT-N)
-│   ├── collation.py        # PackedSequenceCollator
-│   ├── tokenization.py     # NMTTokenizer (32K BPE)
-│   └── document_dataset.py
+│   ├── dataset.py          # All datasets: DocumentNMTDataset, IWSLT14Dataset,
+│   │                       #   OPUSBooksDataset, MQARDataset, MQARCurriculumGenerator
+│   ├── collator.py         # PackedSequenceCollator, ConcatenationAugmenter
+│   └── tokenization.py     # CustomBPETokenizer (32K), NMTTokenizer
 ├── evaluation/
 │   ├── metrics.py          # BLEUScorer, CHRFScorer, COMETScorer
 │   ├── alignment.py        # SubwordToWordMapper, AlignmentEvaluator
@@ -169,9 +193,10 @@ doc_nmt_mamba/
 │   └── test_data_pipeline.py
 └── configs/                # Hydra configuration
     ├── config.yaml         # Main entry point
-    ├── model/              # small/base/medium/large + baseline_transformer
-    ├── training/           # default/debug
-    └── data/               # iwslt14_de_en/opus_books/debug
+    ├── model/              # hybrid_{small,base,medium,large}, baseline_transformer
+    ├── training/           # default, debug
+    ├── data/               # iwslt14_de_en, opus_books, mqar, debug
+    └── experiment/         # ICML/NeurIPS reproducibility configs (17 experiments)
 ```
 
 ## Critical Technical Decisions
@@ -217,3 +242,15 @@ pip install -e ".[viz]"    # matplotlib/seaborn plotting
 pip install -e ".[dev]"    # pytest, black, mypy
 pip install -e ".[all]"    # Everything (GPU environment)
 ```
+
+## Package Justifications (For Reviewers)
+
+| Package | Purpose in Align-Mamba |
+|---------|------------------------|
+| `mamba-ssm` | Provides Mamba-2 CUDA kernels. Crucial for O(L) efficiency claim. |
+| `flash-attn` | FlashAttention-2 for sparse attention layers. Essential for H100 speedups. |
+| `sacrebleu` | Scientific standard for BLEU. Ensures scores are comparable to prior work. |
+| `unbabel-comet` | BLEU correlates poorly with document coherence. COMET proves context handling. |
+| `awesome-align` | Calculates AER (Alignment Error Rate) using mBERT alignments as gold standard. |
+| `spacy` | Entity Recall evaluation. NER to verify "Mr. Smith" consistency across source/target. |
+| `hydra-core` | Enables `configs/experiment/` pattern for exact hyperparameter reproducibility. |

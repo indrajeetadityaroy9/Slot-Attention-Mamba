@@ -1,9 +1,9 @@
-# OPUS Books German-English configuration
-# RECOMMENDED for Document-Level NMT (preserves document boundaries)
+# OPUS Books English-German configuration
+# REQUIRED for ContraPro evaluation (pronoun disambiguation En→De)
 
-name: opus_books_de_en
+name: opus_books_en_de
 
-# Dataset type - CRITICAL for thesis
+# Dataset type - CRITICAL for document-level coherence evaluation
 # opus_books: Literary texts with document structure (consecutive entries from same book)
 # This enables proper document-level learning with CAT-N augmentation
 dataset_name: opus_books
@@ -12,9 +12,9 @@ dataset_name: opus_books
 tokenizer_type: custom  # 32K BPE (RECOMMENDED)
 tokenizer_path: data/tokenizer/tokenizer.json
 
-# Language settings (mBART format - only used if tokenizer_type=mbart)
-src_lang: de_DE
-tgt_lang: en_XX
+# Language settings - SWAPPED for En→De (required for ContraPro)
+src_lang: en_XX
+tgt_lang: de_DE
 
 # Sequence lengths
 max_src_length: 4096

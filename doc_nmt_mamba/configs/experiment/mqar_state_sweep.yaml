@@ -1,13 +1,16 @@
 # @package _global_
-# MQAR State Capacity Sweep
-# Paper Reference: Figure 1
+# MQAR State Capacity Sweep - HYBRID MODEL (NC1)
+# Paper Reference: Figure 1 (Solid Line)
 #
-# Tests Mamba-2 state capacity limits using MQAR synthetic task.
-# d_state=64 forces the state to "forget" earlier pairs.
-# Demonstrates why sparse cross-attention is needed for long-range deps.
+# Tests Align-Mamba (Hybrid) on MQAR using SEQ2SEQ mode.
+# Encoder: BiMamba processes key-value pairs
+# Decoder: Hybrid Mamba uses Cross-Attention to RETRIEVE values
+#
+# This demonstrates the NC1 hypothesis: cross-attention enables
+# perfect retrieval regardless of d_state limits.
 #
 # Curriculum: num_pairs [16, 32, 64, 128, 256, 512]
-# Expected: Performance cliff at num_pairs > d_state
+# Expected: >98% accuracy at all stages (no cliff!)
 
 defaults:
   - /experiment/_base
@@ -17,28 +20,42 @@ defaults:
 
 experiment:
   name: mqar_state_sweep
-  paper_ref: "Figure 1 - State Capacity"
-  description: "MQAR state capacity sweep with curriculum learning"
+  paper_ref: "Figure 1 - State Capacity (Align-Mamba)"
+  description: "MQAR with Hybrid encoder-decoder (NC1 - cross-attention retrieval)"
 
 project:
   name: align_mamba_icml
   seed: 42
 
-# Override model for MQAR (decoder-only, smaller)
+# Model config for Hybrid Seq2Seq
 model:
   d_state: 64  # Match MQAR config
-  encoder_layers: 0  # Decoder-only for MQAR
-  decoder_layers: 8
+  encoder_layers: 8   # BiMamba encoder to process pairs
+  decoder_layers: 8   # Hybrid decoder with cross-attention
+  # Hybrid positions at [0, 4] for 8-layer decoder
+  # cross_attn_every: 4 (default from hybrid_small)
 
-# Shorter training for synthetic task
+# Shorter training for synthetic task - OPTIMIZED FOR H100 80GB
 training:
   max_steps: 20000
   eval_steps: 500
   save_steps: 2000
   warmup_steps: 1000
-  learning_rate: 1e-4
+  learning_rate: 3e-4  # Higher LR for larger batch
+  batch_size: 64       # Reduced for seq2seq (encoder + decoder) with d_model=256
+  dataloader_num_workers: 20
+  dataloader_prefetch_factor: 8
+  gradient_checkpointing: false  # Disable - fixes Mamba stride alignment issue
+  torch_compile: false  # Disable - torch.compile incompatible with Mamba custom kernels
+  use_compile: false
+
+# MQAR in SEQ2SEQ mode for cross-attention retrieval
+data:
+  mqar:
+    seq_length: 2048  # Fits num_pairs up to 512
+    mode: seq2seq     # CRITICAL: Split pairs/queries for encoder-decoder
 
 logging:
   wandb:
-    enabled: true
-    tags: ["mqar", "figure1", "state_capacity", "synthetic"]
+    enabled: false
+    tags: ["mqar", "figure1", "state_capacity", "hybrid", "nc1"]

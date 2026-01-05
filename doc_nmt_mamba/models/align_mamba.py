@@ -142,7 +142,7 @@ class HybridBlock(nn.Module):
     def forward(
         self,
         x,
-        encoder_out,
+        encoder_out: Optional[torch.Tensor] = None,
         decoder_offset: int = 0,
         inference_params=None,
         cu_seqlens_q=None,
@@ -155,7 +155,7 @@ class HybridBlock(nn.Module):
 
         Args:
             x: Decoder hidden states (batch, seq_len, d_model)
-            encoder_out: Encoder output (batch, src_len, d_model)
+            encoder_out: Encoder output (batch, src_len, d_model) or None for decoder-only
             decoder_offset: Position offset for incremental decoding
             inference_params: Mamba inference state (for generation)
             cu_seqlens_*: For packed sequence mode
@@ -169,16 +169,18 @@ class HybridBlock(nn.Module):
         else:
             x = self.mamba(x)
 
-        # Step 2: Cross-attention to encoder
-        x = self.cross_attn(
-            x,
-            encoder_out,
-            decoder_offset=decoder_offset,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-        )
+        # Step 2: Cross-attention to encoder (skip if no encoder output)
+        # For decoder-only mode (e.g., MQAR), HYBRID blocks act as pure Mamba
+        if encoder_out is not None:
+            x = self.cross_attn(
+                x,
+                encoder_out,
+                decoder_offset=decoder_offset,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+            )
 
         return x
 
@@ -467,7 +469,7 @@ class HybridMambaDecoder(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        encoder_out: torch.Tensor,
+        encoder_out: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -475,7 +477,7 @@ class HybridMambaDecoder(nn.Module):
 
         Args:
             input_ids: Target token IDs (batch, seq_len)
-            encoder_out: Encoder output (batch, src_len, d_model)
+            encoder_out: Encoder output (batch, src_len, d_model) or None for decoder-only
             attention_mask: Optional attention mask
 
         Returns:

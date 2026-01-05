@@ -1,0 +1,61 @@
+# @package _global_
+# MQAR State Capacity Sweep - PURE MAMBA BASELINE (TC0)
+# Paper Reference: Figure 1 (Dashed Line)
+#
+# Tests Pure Mamba (no encoder, no cross-attention) on MQAR.
+# Uses DECODER-ONLY mode: full concatenated sequence [pairs...queries].
+#
+# This is the STRONGEST possible test of TC0:
+# - Model sees the FULL history (no encoder bottleneck)
+# - Must rely purely on Mamba's recurrent state to remember pairs
+# - Expected to FAIL when num_pairs > d_state (state compression limit)
+#
+# Curriculum: num_pairs [16, 32, 64, 128, 256, 512]
+# Expected: Accuracy cliff at num_pairs=128+ (exceeds d_state=64)
+
+defaults:
+  - /experiment/_base
+  - override /model: hybrid_small  # Small model for synthetic task
+  - override /data: mqar
+  - override /training: default
+
+experiment:
+  name: mqar_pure_mamba
+  paper_ref: "Figure 1 - State Capacity (Pure Mamba TC0)"
+  description: "MQAR decoder-only baseline - tests Mamba state capacity limit"
+
+project:
+  name: align_mamba_icml
+  seed: 42
+
+# Model config for Pure Mamba (decoder-only)
+model:
+  d_state: 64  # CRITICAL: Forces state capacity cliff
+  encoder_layers: 0  # NO ENCODER - decoder-only mode
+  decoder_layers: 8
+  custom_hybrid_positions: []  # NO HYBRID BLOCKS - Pure Mamba stack
+
+# Training optimized for H100 80GB
+training:
+  max_steps: 20000
+  eval_steps: 500
+  save_steps: 2000
+  warmup_steps: 1000
+  learning_rate: 3e-4
+  batch_size: 128      # Reduced for stability with d_model=256
+  dataloader_num_workers: 20
+  dataloader_prefetch_factor: 8
+  gradient_checkpointing: false  # Disable - fixes Mamba stride alignment issue
+  torch_compile: false  # Disable - torch.compile incompatible with Mamba custom kernels
+  use_compile: false
+
+# MQAR in DECODER-ONLY mode (concatenated sequence)
+data:
+  mqar:
+    seq_length: 2048  # Fits num_pairs up to 512
+    mode: decoder_only  # CRITICAL: Full [pairs...queries] to decoder
+
+logging:
+  wandb:
+    enabled: false
+    tags: ["mqar", "figure1", "state_capacity", "pure_mamba", "tc0"]

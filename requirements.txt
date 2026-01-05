@@ -32,7 +32,7 @@ unbabel-comet>=2.2.2       # COMET neural metric (NeurIPS standard)
 evaluate>=0.4.2            # HuggingFace eval wrapper
 
 # --- Evaluation: Alignment (AER) ---
-awesome-align>=1.0.0       # Neural word alignment tool
+awesome-align>=0.1.7       # Neural word alignment tool
 transformers>=4.40.0       # Required for awesome-align & COMET
 
 # --- Evaluation: Entity & Coherence ---

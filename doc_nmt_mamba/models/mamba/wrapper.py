@@ -76,6 +76,9 @@ class Mamba2BlockWrapper(nn.Module):
         residual = x
         x = self.norm(x)
 
+        # Ensure contiguous for Mamba CUDA kernels (stride alignment requirement)
+        x = x.contiguous()
+
         if inference_params is not None:
             conv_state, ssm_state = inference_params
             x, conv_state_out, ssm_state_out = self.mamba.step(x, conv_state, ssm_state)

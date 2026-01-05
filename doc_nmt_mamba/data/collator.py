@@ -528,10 +528,14 @@ class MQARCollator:
     """
     Collator for Multi-Query Associative Recall (MQAR) task.
 
-    MQAR Structure: [Pairs] [SEP] [Queries]
-    - Pairs: key-value pairs for memorization
-    - SEP: separator token
-    - Queries: keys to look up
+    MODES:
+    - "decoder_only": For Pure Mamba baseline (TC0)
+      Input: input_ids=[BOS pairs... QUERY queries... EOS]
+      Output: input_ids, labels, attention_mask
+
+    - "seq2seq": For Hybrid model with cross-attention (NC1)
+      Input: src_ids=[BOS pairs... EOS], tgt_ids=[BOS queries... EOS]
+      Output: src_ids, tgt_ids, labels (for standard NMT training)
 
     CRITICAL: Queries must be STRICTLY after all pairs.
     No interleaving: [Pairs] [Query] [Pairs] is INVALID.
@@ -542,25 +546,102 @@ class MQARCollator:
         pad_token_id: int = 0,
         sep_token_id: int = 3,
         max_length: Optional[int] = None,
+        mode: str = "decoder_only",
     ):
         """
         Args:
             pad_token_id: Padding token ID
             sep_token_id: Separator token ID
             max_length: Maximum sequence length
+            mode: "decoder_only" (Pure Mamba) or "seq2seq" (Hybrid)
         """
+        if mode not in ("decoder_only", "seq2seq"):
+            raise ValueError(f"mode must be 'decoder_only' or 'seq2seq', got '{mode}'")
+
         self.pad_token_id = pad_token_id
         self.sep_token_id = sep_token_id
         self.max_length = max_length
+        self.mode = mode
 
     def __call__(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         """
-        Collate MQAR batch.
+        Collate MQAR batch based on mode.
+        """
+        if self.mode == "seq2seq":
+            return self._collate_seq2seq(batch)
+        else:
+            return self._collate_decoder_only(batch)
 
-        Expected input format per sample:
-        - 'input_ids': Full sequence [pairs, SEP, queries]
-        - 'labels': Target values for queries
-        - 'query_positions': Positions of query tokens
+    def _collate_seq2seq(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """
+        Collate for seq2seq mode (Hybrid model with encoder-decoder).
+
+        Returns dict with:
+        - src_ids: Source sequences (context with key-value pairs)
+        - tgt_ids: Target sequences (queries) - decoder input
+        - labels: Expected values for loss computation
+
+        Note: labels.shape = (batch, tgt_len - 1) to match decoder output
+              since trainer does tgt_ids[:, :-1] for decoder input.
+        """
+        src_ids_list = [item['src_ids'] for item in batch]
+        tgt_ids_list = [item['tgt_ids'] for item in batch]
+        labels_list = [item['labels'] for item in batch]
+
+        # Determine max lengths
+        max_src_len = max(len(seq) for seq in src_ids_list)
+        max_tgt_len = max(len(seq) for seq in tgt_ids_list)
+
+        if self.max_length:
+            max_src_len = min(max_src_len, self.max_length)
+            max_tgt_len = min(max_tgt_len, self.max_length)
+
+        # Labels length = tgt_len - 1 (to match decoder output after truncation)
+        max_labels_len = max_tgt_len - 1
+
+        # Pad sequences
+        padded_src = []
+        padded_tgt = []
+        padded_labels = []
+
+        for src, tgt, lab in zip(src_ids_list, tgt_ids_list, labels_list):
+            src = src[:max_src_len]
+            tgt = tgt[:max_tgt_len]
+            lab = lab[:max_labels_len]
+
+            # Pad source
+            src_pad_len = max_src_len - len(src)
+            padded_src.append(F.pad(src, (0, src_pad_len), value=self.pad_token_id))
+
+            # Pad target
+            tgt_pad_len = max_tgt_len - len(tgt)
+            padded_tgt.append(F.pad(tgt, (0, tgt_pad_len), value=self.pad_token_id))
+
+            # Pad labels with -100 (ignore_index) to match decoder output length
+            padded_lab = torch.full((max_labels_len,), -100, dtype=lab.dtype)
+            padded_lab[:len(lab)] = lab
+            padded_labels.append(padded_lab)
+
+        src_tensor = torch.stack(padded_src)
+        tgt_tensor = torch.stack(padded_tgt)
+        labels_tensor = torch.stack(padded_labels)
+
+        return {
+            'src_ids': src_tensor,
+            'tgt_ids': tgt_tensor,
+            'labels': labels_tensor,
+            'src_mask': (src_tensor != self.pad_token_id).long(),
+            'tgt_mask': (tgt_tensor != self.pad_token_id).long(),
+        }
+
+    def _collate_decoder_only(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """
+        Collate for decoder-only mode (Pure Mamba baseline).
+
+        Returns dict with:
+        - input_ids: Full concatenated sequences
+        - labels: Target values (with -100 for ignored positions)
+        - attention_mask: Mask for padding
         """
         input_ids = [item['input_ids'] for item in batch]
         labels = [item['labels'] for item in batch]
@@ -574,8 +655,6 @@ class MQARCollator:
         padded_inputs = []
         padded_labels = []
 
-        label_masks = []
-
         for inp, lab in zip(input_ids, labels):
             inp = inp[:max_len]
             lab = lab[:max_len]
@@ -583,20 +662,17 @@ class MQARCollator:
             pad_len = max_len - len(inp)
             padded_inputs.append(F.pad(inp, (0, pad_len), value=self.pad_token_id))
 
-            # Pad labels
-            padded_lab = torch.full((max_len,), self.pad_token_id, dtype=lab.dtype)
+            # Pad labels with -100 (ignore_index)
+            padded_lab = torch.full((max_len,), -100, dtype=lab.dtype)
             padded_lab[:len(lab)] = lab
             padded_labels.append(padded_lab)
 
-            # Label mask: 1 where we have valid labels (not PAD), 0 elsewhere
-            label_mask = (padded_lab != self.pad_token_id).long()
-            label_masks.append(label_mask)
+        input_tensor = torch.stack(padded_inputs)
 
         return {
-            'input_ids': torch.stack(padded_inputs),
+            'input_ids': input_tensor,
             'labels': torch.stack(padded_labels),
-            'attention_mask': (torch.stack(padded_inputs) != self.pad_token_id).long(),
-            'label_mask': torch.stack(label_masks),
+            'attention_mask': (input_tensor != self.pad_token_id).long(),
         }
 
 

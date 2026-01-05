@@ -74,7 +74,7 @@ comet = [
 
 # Word alignment for AER evaluation
 alignment = [
-    "awesome-align>=1.0.0",
+    "awesome-align>=0.1.7",
 ]
 
 # spaCy for Entity Recall analysis
@@ -105,7 +105,7 @@ all = [
     "causal-conv1d>=1.2.0",
     "flash-attn>=2.5.8",
     "unbabel-comet>=2.2.2",
-    "awesome-align>=1.0.0",
+    "awesome-align>=0.1.7",
     "spacy>=3.7.4",
     "scipy>=1.13.0",
     "matplotlib>=3.8.4",
@@ -120,7 +120,7 @@ all = [
 # CPU-only installation (for development/testing without GPU)
 cpu = [
     "unbabel-comet>=2.2.2",
-    "awesome-align>=1.0.0",
+    "awesome-align>=0.1.7",
     "spacy>=3.7.4",
     "scipy>=1.13.0",
     "matplotlib>=3.8.4",

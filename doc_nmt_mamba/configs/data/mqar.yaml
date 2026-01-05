@@ -10,6 +10,14 @@ name: mqar
 dataset_type: synthetic
 dataset_class: MQARDataset
 
+# Sequence lengths (required by train.py tokenizer setup)
+max_src_length: 2048
+max_tgt_length: 2048
+
+# Tokenizer settings (MQAR uses its own vocabulary but train.py expects these)
+tokenizer_type: custom
+tokenizer_path: data/tokenizer/tokenizer.json
+
 # MQAR configuration (forces state capacity cliff)
 mqar:
   d_state: 64  # CRITICAL: Forces state to forget
@@ -40,7 +48,7 @@ curriculum:
 # Collation
 collator_mode: mqar
 
-# Data loading
-num_workers: 4
-prefetch_factor: 2
+# Data loading - OPTIMIZED FOR 26 CPU CORES
+num_workers: 20
+prefetch_factor: 8
 pin_memory: true

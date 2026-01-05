@@ -69,6 +69,7 @@ class RunnerConfig:
     # ContraPro evaluation
     use_synthetic_contrapro: bool = False
     max_contrapro_samples: Optional[int] = None
+    contrapro_data_path: str = "data/contrapro/contrapro.json"  # Path to ContraPro data
     contrapro_distances: List[int] = field(
         default_factory=lambda: [1, 2, 3, 4, 5, 10, 20]
     )
@@ -437,8 +438,12 @@ class EvaluationRunner:
             )
         else:
             try:
-                dataset = ContraProDataset()
-                samples = dataset.load(max_samples=self.config.max_contrapro_samples)
+                # FIX: Pass data_path from config
+                dataset = ContraProDataset(data_path=self.config.contrapro_data_path)
+                # FIX: ContraProDataset has no .load() method - use list slicing
+                all_samples = list(dataset)
+                max_samples = self.config.max_contrapro_samples
+                samples = all_samples[:max_samples] if max_samples else all_samples
             except Exception as e:
                 print(f"Failed to load ContraPro: {e}")
                 print("Using synthetic data instead...")

@@ -169,7 +169,7 @@ class HybridMambaEncoderDecoder(nn.Module):
 
     def forward(
         self,
-        src_ids: torch.Tensor,
+        src_ids: Optional[torch.Tensor],
         tgt_ids: torch.Tensor,
         src_mask: Optional[torch.Tensor] = None,
         tgt_mask: Optional[torch.Tensor] = None,
@@ -178,7 +178,7 @@ class HybridMambaEncoderDecoder(nn.Module):
         Forward pass for training.
 
         Args:
-            src_ids: Source token IDs (batch, src_len)
+            src_ids: Source token IDs (batch, src_len) or None for decoder-only mode
             tgt_ids: Target token IDs (batch, tgt_len)
             src_mask: Optional source attention mask
             tgt_mask: Optional target attention mask
@@ -186,7 +186,12 @@ class HybridMambaEncoderDecoder(nn.Module):
         Returns:
             Logits (batch, tgt_len, vocab_size)
         """
-        encoder_out = self.encoder(src_ids, attention_mask=src_mask)
+        # Decoder-only mode: skip encoder when src_ids is None or encoder has 0 layers
+        if src_ids is None or self.config.encoder_layers == 0:
+            encoder_out = None
+        else:
+            encoder_out = self.encoder(src_ids, attention_mask=src_mask)
+
         logits = self.decoder(tgt_ids, encoder_out, attention_mask=tgt_mask)
         return logits
 

@@ -421,6 +421,14 @@ class Trainer:
                 loss = self._training_step(batch)
                 loss = loss / self.config.gradient_accumulation_steps
 
+            # NaN/Inf loss guard (publication-grade stability)
+            # Check BEFORE backward to avoid corrupting gradients
+            if torch.isnan(loss) or torch.isinf(loss):
+                if self.is_main:
+                    print(f"WARNING: NaN/Inf loss detected at step {self.global_step}, skipping batch")
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
+
             # Backward pass
             loss.backward()
             accumulated_loss += loss.item()
@@ -519,8 +527,21 @@ class Trainer:
             labels_flat = labels_for_loss.reshape(-1)
 
             loss = self.loss_fn(logits_flat, labels_flat)
+        elif "input_ids" in batch:
+            # MQAR synthetic task (decoder-only, no encoder)
+            input_ids = batch["input_ids"]
+            labels = batch["labels"]
+
+            # For MQAR, we use decoder-only mode: pass None for encoder input
+            # The model should handle this case for decoder-only architectures
+            logits = self.model(None, input_ids)
+
+            # Compute loss (labels already have -100 for non-query positions)
+            logits_flat = logits.reshape(-1, logits.size(-1))
+            labels_flat = labels.reshape(-1)
+            loss = self.loss_fn(logits_flat, labels_flat)
         else:
-            # Padded sequences
+            # Padded sequences (standard NMT)
             src_ids = batch["src_ids"]
             tgt_ids = batch["tgt_ids"]
             labels = batch.get("labels", tgt_ids[:, 1:])

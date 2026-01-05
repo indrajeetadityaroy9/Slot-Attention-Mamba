@@ -21,11 +21,14 @@ from typing import List, Dict, Optional, Tuple, Union, Any, Iterator
 from pathlib import Path
 import hashlib
 import random
+import logging
 
 import torch
 from torch.utils.data import Dataset, IterableDataset
 
 from .collator import DocumentSample, ConcatenationAugmenter
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -142,6 +145,12 @@ class MQARDataset(Dataset):
     3. Structure: [key1 : val1 key2 : val2 ... QUERY k1 k2 ... EOS] - NO INTERLEAVING
     4. d_state=64 to force state capacity cliff
 
+    MODES:
+    - "decoder_only": Concatenated sequence for pure Mamba baseline (TC0)
+      Returns: input_ids=[BOS pairs... QUERY queries... EOS], labels=[values at query positions]
+    - "seq2seq": Split sequence for Hybrid model (NC1) to test cross-attention retrieval
+      Returns: src_ids=[BOS pairs... EOS], tgt_ids=[BOS queries... EOS], labels=[expected values]
+
     Reference: Based on "Hungry Hungry Hippos" and Mamba papers.
     """
 
@@ -151,6 +160,7 @@ class MQARDataset(Dataset):
         num_samples: int = 10000,
         split: str = "train",
         seed: Optional[int] = None,
+        mode: str = "decoder_only",
     ):
         """
         Args:
@@ -158,10 +168,39 @@ class MQARDataset(Dataset):
             num_samples: Number of samples to generate
             split: "train", "validation", or "test"
             seed: Random seed for reproducibility (overrides config.seed)
+            mode: "decoder_only" (Pure Mamba) or "seq2seq" (Hybrid with cross-attention)
         """
+        if mode not in ("decoder_only", "seq2seq"):
+            raise ValueError(f"mode must be 'decoder_only' or 'seq2seq', got '{mode}'")
+
         self.config = config
         self.num_samples = num_samples
         self.split = split
+        self.mode = mode
+
+        # ===== Input Validation (crash prevention) =====
+        # Calculate minimum sequence length needed:
+        # BOS + (num_pairs * 3 tokens each: key, sep, value) + QUERY + num_queries + EOS
+        num_queries = min(config.num_queries, config.num_pairs)
+        min_seq_len = 1 + (config.num_pairs * 3) + 1 + num_queries + 1
+
+        if config.seq_length < min_seq_len:
+            old_seq_len = config.seq_length
+            # Auto-extend with 10% buffer for safety
+            config.seq_length = int(min_seq_len * 1.1)
+            logger.warning(
+                f"seq_length={old_seq_len} too short for num_pairs={config.num_pairs}. "
+                f"Auto-extended to {config.seq_length} (min required: {min_seq_len})"
+            )
+
+        # Validate vocab_size is sufficient for unique keys
+        key_range_size = config.key_token_end - config.key_token_start
+        if key_range_size < config.num_pairs:
+            raise ValueError(
+                f"Key range [{config.key_token_start}, {config.key_token_end}) "
+                f"has only {key_range_size} unique keys, but num_pairs={config.num_pairs} required. "
+                f"Increase key_token_end or decrease num_pairs."
+            )
 
         # Set seed for reproducibility (seed param takes priority)
         self._seed = seed if seed is not None else (config.seed if config.seed else 42)
@@ -180,13 +219,14 @@ class MQARDataset(Dataset):
         """
         Generate a single MQAR sample.
 
-        Structure: [BOS key1 : val1 key2 : val2 ... QUERY k1 k2 ... EOS PAD...]
+        For decoder_only mode:
+            Structure: [BOS key1 : val1 key2 : val2 ... QUERY k1 k2 ... EOS PAD...]
+            Returns: input_ids, labels (with values at query positions)
 
-        Returns dict with:
-        - input_ids: Full sequence (padded to seq_length)
-        - labels: [PAD..., values at query positions, EOS, PAD...]
-        - query_positions: positions of query tokens
-        - num_pairs: number of KV pairs in this sample
+        For seq2seq mode:
+            Source: [BOS key1 : val1 key2 : val2 ... EOS]  (Context for encoder)
+            Target: [BOS k1 k2 ... EOS]  (Queries for decoder)
+            Labels: [val1 val2 ... EOS]  (Expected values, aligned with queries)
         """
         # Generate unique keys
         key_range = range(self.config.key_token_start, self.config.key_token_end)
@@ -202,57 +242,125 @@ class MQARDataset(Dataset):
         # Select queries (subset of keys)
         query_keys = self._rng.sample(keys, min(self.config.num_queries, len(keys)))
 
-        # Build input sequence: [BOS key1 : val1 key2 : val2 ... QUERY k1 k2 ... EOS]
-        input_ids = []
+        if self.mode == "seq2seq":
+            # ===== SEQ2SEQ MODE (for Hybrid model with cross-attention) =====
+            # This tests the NC1 hypothesis: cross-attention can retrieve from encoder.
+            #
+            # Source (Encoder): [BOS key1 : val1 key2 : val2 ... EOS]
+            # Target (Decoder): [BOS q1 q2 ... qM EOS]
+            #
+            # Label alignment for teacher forcing:
+            # - Decoder input: [BOS, q1, q2, ..., qM] (truncated, no EOS)
+            # - At position 0 (sees BOS): no prediction -> label = -100
+            # - At position 1 (sees BOS, q1): predict v1
+            # - At position i (sees BOS, q1..qi): predict vi
+            # - Labels: [-100, v1, v2, ..., vM] aligned with decoder positions
 
-        # Start with BOS token
-        input_ids.append(self.config.bos_token_id)
+            # Build source sequence (context with key-value pairs)
+            src_ids = [self.config.bos_token_id]
+            for k, v in zip(keys, values):
+                src_ids.append(k)
+                src_ids.append(self.config.kv_sep_token_id)  # :
+                src_ids.append(v)
+            src_ids.append(self.config.eos_token_id)
 
-        # Add key-value pairs with separators: key : value
-        for k, v in zip(keys, values):
-            input_ids.append(k)
-            input_ids.append(self.config.kv_sep_token_id)  # :
-            input_ids.append(v)
+            # Build target sequence (queries) - decoder input
+            tgt_ids = [self.config.bos_token_id]
+            for qk in query_keys:
+                tgt_ids.append(qk)
+            tgt_ids.append(self.config.eos_token_id)
 
-        # Add QUERY marker
-        query_marker_position = len(input_ids)
-        input_ids.append(self.config.query_token_id)
+            # Build labels with correct alignment:
+            # - Position 0 (BOS): -100 (ignore)
+            # - Positions 1..M: values v1..vM
+            # Length = M+1 to match decoder_input = tgt_ids[:, :-1]
+            labels = [-100]  # Ignore BOS position
+            for qk in query_keys:
+                labels.append(kv_map[qk])
 
-        # Add queries
-        query_positions = []
-        for qk in query_keys:
-            query_positions.append(len(input_ids))
-            input_ids.append(qk)
+            # Pad sequences
+            src_len = len(src_ids)
+            tgt_len = len(tgt_ids)
+            labels_len = len(labels)
 
-        # Add EOS
-        input_ids.append(self.config.eos_token_id)
+            # Pad source to max source length
+            max_src_len = 1 + (self.config.num_pairs * 3) + 1  # BOS + pairs + EOS
+            if src_len < max_src_len:
+                src_ids.extend([self.config.pad_token_id] * (max_src_len - src_len))
 
-        # Build labels: PAD everywhere except answer positions (after query tokens)
-        # Labels format: PAD until QUERY section, then expected values, then PAD
-        labels = [self.config.pad_token_id] * len(input_ids)
-        for pos, qk in zip(query_positions, query_keys):
-            labels[pos] = kv_map[qk]  # The expected value
+            # Pad target to include EOS (trainer will truncate)
+            max_tgt_len = 1 + self.config.num_queries + 1  # BOS + queries + EOS
+            if tgt_len < max_tgt_len:
+                tgt_ids.extend([self.config.pad_token_id] * (max_tgt_len - tgt_len))
 
-        # Pad to seq_length if specified
-        seq_length = self.config.seq_length
-        if len(input_ids) < seq_length:
-            padding_len = seq_length - len(input_ids)
-            input_ids.extend([self.config.pad_token_id] * padding_len)
-            labels.extend([self.config.pad_token_id] * padding_len)
-        elif len(input_ids) > seq_length:
-            # Truncate (should not happen with proper config)
-            input_ids = input_ids[:seq_length]
-            labels = labels[:seq_length]
+            # Labels length = tgt_len - 1 (no label for EOS position)
+            max_labels_len = max_tgt_len - 1
+            if labels_len < max_labels_len:
+                labels.extend([-100] * (max_labels_len - labels_len))
 
-        return {
-            'input_ids': torch.tensor(input_ids, dtype=torch.long),
-            'labels': torch.tensor(labels, dtype=torch.long),
-            'query_positions': torch.tensor(query_positions, dtype=torch.long),
-            'query_keys': torch.tensor(query_keys, dtype=torch.long),
-            'expected_values': torch.tensor([kv_map[k] for k in query_keys], dtype=torch.long),
-            'num_pairs': torch.tensor(self.config.num_pairs, dtype=torch.long),
-            'num_queries': torch.tensor(len(query_keys), dtype=torch.long),
-        }
+            return {
+                'src_ids': torch.tensor(src_ids, dtype=torch.long),
+                'tgt_ids': torch.tensor(tgt_ids, dtype=torch.long),
+                'labels': torch.tensor(labels, dtype=torch.long),
+                'query_keys': torch.tensor(query_keys, dtype=torch.long),
+                'expected_values': torch.tensor([kv_map[k] for k in query_keys], dtype=torch.long),
+                'num_pairs': torch.tensor(self.config.num_pairs, dtype=torch.long),
+                'num_queries': torch.tensor(len(query_keys), dtype=torch.long),
+            }
+
+        else:
+            # ===== DECODER-ONLY MODE (for Pure Mamba baseline) =====
+            # Build input sequence: [BOS key1 : val1 key2 : val2 ... QUERY k1 k2 ... EOS]
+            input_ids = []
+
+            # Start with BOS token
+            input_ids.append(self.config.bos_token_id)
+
+            # Add key-value pairs with separators: key : value
+            for k, v in zip(keys, values):
+                input_ids.append(k)
+                input_ids.append(self.config.kv_sep_token_id)  # :
+                input_ids.append(v)
+
+            # Add QUERY marker
+            query_marker_position = len(input_ids)
+            input_ids.append(self.config.query_token_id)
+
+            # Add queries
+            query_positions = []
+            for qk in query_keys:
+                query_positions.append(len(input_ids))
+                input_ids.append(qk)
+
+            # Add EOS
+            input_ids.append(self.config.eos_token_id)
+
+            # Build labels: -100 everywhere except answer positions (after query tokens)
+            # Using -100 (ignore_index) for positions not contributing to loss
+            labels = [-100] * len(input_ids)
+            for pos, qk in zip(query_positions, query_keys):
+                labels[pos] = kv_map[qk]  # The expected value
+
+            # Pad to seq_length if specified
+            seq_length = self.config.seq_length
+            if len(input_ids) < seq_length:
+                padding_len = seq_length - len(input_ids)
+                input_ids.extend([self.config.pad_token_id] * padding_len)
+                labels.extend([-100] * padding_len)
+            elif len(input_ids) > seq_length:
+                # Truncate (should not happen with proper config)
+                input_ids = input_ids[:seq_length]
+                labels = labels[:seq_length]
+
+            return {
+                'input_ids': torch.tensor(input_ids, dtype=torch.long),
+                'labels': torch.tensor(labels, dtype=torch.long),
+                'query_positions': torch.tensor(query_positions, dtype=torch.long),
+                'query_keys': torch.tensor(query_keys, dtype=torch.long),
+                'expected_values': torch.tensor([kv_map[k] for k in query_keys], dtype=torch.long),
+                'num_pairs': torch.tensor(self.config.num_pairs, dtype=torch.long),
+                'num_queries': torch.tensor(len(query_keys), dtype=torch.long),
+            }
 
     def __len__(self) -> int:
         return self.num_samples

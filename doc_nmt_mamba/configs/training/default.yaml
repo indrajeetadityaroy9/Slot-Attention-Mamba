@@ -1,17 +1,17 @@
-# Default training configuration for 2x H100 80GB SXM5
-# Optimized for maximum throughput on high-end hardware
+# Default training configuration for 1x H100 80GB HBM3
+# Optimized for maximum throughput on single GPU (no DDP overhead)
 
 # =============================================================================
-# Batch Size - AGGRESSIVE SCALING
+# Batch Size - MAXIMIZE FOR SINGLE H100 80GB
 # =============================================================================
-# 200M model uses ~2GB VRAM. With 80GB per GPU, maximize batch size
-# to saturate H100 compute throughput and avoid GPU starvation.
-per_device_train_batch_size: 128  # Start here, can push to 256 for shorter sequences
-gradient_accumulation_steps: 1    # Disable accumulation for speed (set to 1)
-per_device_eval_batch_size: 256   # Larger for faster eval
+# 200M model uses ~8-12GB VRAM. With 80GB available, maximize batch size
+# to saturate H100 compute throughput. Single GPU = no DDP comm overhead.
+per_device_train_batch_size: 256  # Aggressive for single H100 (adjust per seq_len)
+gradient_accumulation_steps: 1    # No accumulation needed with large batch
+per_device_eval_batch_size: 512   # Larger for faster eval
 
 # Legacy alias (for backward compatibility)
-batch_size: 128
+batch_size: 256
 
 # =============================================================================
 # Training Loop
@@ -22,8 +22,8 @@ max_grad_norm: 1.0
 # =============================================================================
 # Optimization
 # =============================================================================
-# LR scaled for DDP: 2x GPUs = 2x effective batch = ~sqrt(2) or 2x LR
-learning_rate: 2e-4  # Scaled from 1e-4 for DDP with 2x batch
+# Single GPU: Use standard LR (no DDP scaling needed)
+learning_rate: 3e-4  # Higher LR for larger batch size (256 vs 64)
 weight_decay: 0.01
 betas: [0.9, 0.95]   # Slightly higher beta2 for stability with large batches
 eps: 1e-8
@@ -63,13 +63,13 @@ cudnn_benchmark: true       # Autotune convolutions
 channels_last: true         # Memory format optimization
 
 # =============================================================================
-# DataLoader - LEVERAGING 52 vCPUs + 450GB RAM
+# DataLoader - LEVERAGING 26 vCPUs + 221GB RAM
 # =============================================================================
-# 16 workers per GPU = 32 total, leaves 20 vCPUs for OS/overhead
-dataloader_num_workers: 16
+# Single GPU: Use 20 workers, leave 6 cores for GPU/OS/overhead
+dataloader_num_workers: 20
 dataloader_pin_memory: true
 dataloader_persistent_workers: true  # Keep workers alive between epochs
-dataloader_prefetch_factor: 4        # Aggressive prefetching (450GB RAM)
+dataloader_prefetch_factor: 8        # Aggressive prefetching (221GB RAM available)
 dataloader_drop_last: true           # Consistent batch sizes
 
 # =============================================================================
@@ -79,15 +79,15 @@ gradient_checkpointing: true  # Enable for 8K sequences
 empty_cache_steps: 1000       # Periodic cache clearing
 
 # =============================================================================
-# Distributed Training (2x H100 NVLink)
+# Distributed Training (Single H100 - DDP disabled by default)
 # =============================================================================
-distributed_strategy: ddp
+distributed_strategy: none     # Single GPU - no DDP overhead
 find_unused_parameters: false  # Faster if all params used
 static_graph: true             # Enable for torch.compile compatibility
 gradient_as_bucket_view: true  # Memory optimization
-bucket_cap_mb: 512             # Large buckets for high-bandwidth NVLink (H100 SXM5)
+bucket_cap_mb: 512             # Large buckets (used if DDP enabled)
 
-# FSDP settings (if using FSDP instead of DDP)
+# FSDP settings (if using FSDP for larger models)
 fsdp_sharding: full_shard
 fsdp_cpu_offload: false        # Not needed with 80GB VRAM
 

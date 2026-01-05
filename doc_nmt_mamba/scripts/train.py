@@ -65,6 +65,11 @@ def setup_environment():
 
 def create_model(cfg: DictConfig, device: str, dtype: torch.dtype) -> HybridMambaEncoderDecoder:
     """Create model from config."""
+    # Handle custom_hybrid_positions from Hydra config (critical for ablations)
+    custom_positions = cfg.model.get("custom_hybrid_positions")
+    if custom_positions is not None:
+        custom_positions = list(custom_positions)  # Convert OmegaConf list to Python list
+
     model_cfg = ModelConfig(
         vocab_size=cfg.model.vocab_size,
         d_model=cfg.model.d_model,
@@ -76,6 +81,7 @@ def create_model(cfg: DictConfig, device: str, dtype: torch.dtype) -> HybridMamb
         cross_attn_every=cfg.model.cross_attn_every,
         dropout=cfg.model.dropout,
         max_seq_len=cfg.model.max_seq_len,
+        custom_hybrid_positions=custom_positions,  # FIX: Enable ablation experiments
     )
 
     model = HybridMambaEncoderDecoder(
@@ -108,38 +114,96 @@ def create_dataloaders(cfg: DictConfig, tokenizer, dist_info: dict):
     """Create training and validation dataloaders with distributed support."""
     # Get dataset name from config (default: opus_books for document-level)
     dataset_name = cfg.data.get("dataset_name", "opus_books")
+    dataset_type = cfg.data.get("dataset_type", "nmt")
 
-    # Create augmenter for training
-    augmenter = ConcatenationAugmenter(
-        n_sentences=cfg.data.cat_n,
-        p_concat=cfg.data.p_concat,
-    )
+    # Handle MQAR synthetic dataset specially
+    if dataset_type == "synthetic" or dataset_name == "mqar":
+        from data import MQARDataset, MQARConfig
 
-    # Training dataset - use factory function for proper dataset selection
-    train_dataset = create_dataset(
-        dataset_name=dataset_name,
-        split="train",
-        tokenizer=tokenizer,
-        augmenter=augmenter,
-        max_src_length=cfg.data.max_src_length,
-        max_tgt_length=cfg.data.max_tgt_length,
-    )
+        # Build MQARConfig from Hydra config
+        mqar_cfg = cfg.data.get("mqar", {})
+        mqar_config = MQARConfig(
+            d_state=mqar_cfg.get("d_state", 64),
+            num_pairs=mqar_cfg.get("num_pairs", 64),
+            num_queries=mqar_cfg.get("num_queries", 16),
+            vocab_size=mqar_cfg.get("vocab_size", 8192),
+            seq_length=mqar_cfg.get("seq_length", 512),
+            pad_token_id=mqar_cfg.get("pad_token_id", 0),
+            bos_token_id=mqar_cfg.get("bos_token_id", 1),
+            eos_token_id=mqar_cfg.get("eos_token_id", 2),
+            kv_sep_token_id=mqar_cfg.get("kv_sep_token_id", 3),
+            query_token_id=mqar_cfg.get("query_token_id", 4),
+            key_token_start=mqar_cfg.get("key_token_start", 10),
+            key_token_end=mqar_cfg.get("key_token_end", 4096),
+            value_token_start=mqar_cfg.get("value_token_start", 4096),
+            value_token_end=mqar_cfg.get("value_token_end", 8192),
+        )
 
-    # Validation dataset (no augmentation)
-    val_dataset = create_dataset(
-        dataset_name=dataset_name,
-        split="validation",
-        tokenizer=tokenizer,
-        augmenter=None,
-        max_src_length=cfg.data.max_src_length,
-        max_tgt_length=cfg.data.max_tgt_length,
-    )
+        # MQAR mode: "decoder_only" for Pure Mamba, "seq2seq" for Hybrid
+        # seq2seq mode enables cross-attention retrieval for state capacity test
+        mqar_mode = mqar_cfg.get("mode", "decoder_only")
 
-    # Create collator
-    collator = create_collator(
-        mode=cfg.data.collator_mode,
-        pad_token_id=tokenizer.pad_token_id,
-    )
+        # Create MQAR datasets with mode
+        curriculum_cfg = cfg.data.get("curriculum", {})
+        num_samples = curriculum_cfg.get("samples_per_stage", 10000)
+
+        train_dataset = MQARDataset(
+            config=mqar_config,
+            num_samples=num_samples,
+            split="train",
+            mode=mqar_mode,
+        )
+        val_dataset = MQARDataset(
+            config=mqar_config,
+            num_samples=num_samples // 10,  # Smaller validation set
+            split="validation",
+            mode=mqar_mode,
+        )
+
+        # MQAR collator with matching mode
+        from data import MQARCollator
+        collator = MQARCollator(pad_token_id=mqar_config.pad_token_id, mode=mqar_mode)
+
+        if dist_info.get("is_main", True):
+            print(f"MQAR mode: {mqar_mode}")
+            if mqar_mode == "seq2seq":
+                print("  -> Encoder-Decoder with cross-attention (tests NC1 retrieval)")
+            else:
+                print("  -> Decoder-only (tests TC0 state capacity)")
+
+    else:
+        # Standard NMT datasets
+        # Create augmenter for training
+        augmenter = ConcatenationAugmenter(
+            n_sentences=cfg.data.cat_n,
+            p_concat=cfg.data.p_concat,
+        )
+
+        # Training dataset - use factory function for proper dataset selection
+        train_dataset = create_dataset(
+            dataset_name=dataset_name,
+            split="train",
+            tokenizer=tokenizer,
+            augmenter=augmenter,
+            max_src_length=cfg.data.max_src_length,
+            max_tgt_length=cfg.data.max_tgt_length,
+        )
+
+        # Validation dataset (no augmentation)
+        val_dataset = create_dataset(
+            dataset_name=dataset_name,
+            split="validation",
+            tokenizer=tokenizer,
+            augmenter=None,
+            max_src_length=cfg.data.max_src_length,
+            max_tgt_length=cfg.data.max_tgt_length,
+        )
+
+        # Create collator
+        collator = create_collator(
+            mode=cfg.data.collator_mode,
+            pad_token_id=tokenizer.pad_token_id,
+        )
 
     # Create samplers for distributed training
     world_size = dist_info.get("world_size", 1)
@@ -233,39 +297,53 @@ def main(cfg: DictConfig):
         print(f"Dtype: {dtype}")
         print(f"World Size: {dist_info['world_size']}")
 
-    # Create tokenizer
-    if is_main:
-        print("\nLoading tokenizer...")
-    tokenizer_type = cfg.data.get("tokenizer_type", "custom")
-    tokenizer_path = cfg.data.get("tokenizer_path", "data/tokenizer/tokenizer.json")
+    # Check if MQAR synthetic task (no tokenizer needed)
+    dataset_type = cfg.data.get("dataset_type", "nmt")
+    is_mqar = dataset_type == "synthetic" or cfg.data.get("dataset_name") == "mqar"
 
-    if tokenizer_type == "custom":
-        # RECOMMENDED: 32K BPE tokenizer for proper parameter allocation
-        tokenizer = create_tokenizer(
-            tokenizer_type="custom",
-            tokenizer_path=tokenizer_path,
-            max_length=cfg.data.max_src_length,
-        )
+    if is_mqar:
+        # MQAR uses its own vocabulary (8192 tokens)
         if is_main:
-            print(f"Using Custom 32K BPE tokenizer (RECOMMENDED)")
+            print("\nMQAR synthetic task - using internal vocabulary")
+        mqar_vocab_size = cfg.data.get("mqar", {}).get("vocab_size", 8192)
+        cfg.model.vocab_size = mqar_vocab_size
+        tokenizer = None  # MQAR doesn't need tokenizer
+        if is_main:
+            print(f"MQAR vocab size: {mqar_vocab_size}")
     else:
-        # NOT RECOMMENDED: mBART 250K vocab makes model 95% embedding table
-        import warnings
+        # Create tokenizer for NMT tasks
         if is_main:
-            warnings.warn(
-                "Using mBART tokenizer (250K vocab). "
-                "This makes the model 95% embedding table. "
-                "Use tokenizer_type='custom' for thesis work."
-            )
-        tokenizer = NMTTokenizer(
-            src_lang=cfg.data.src_lang,
-            tgt_lang=cfg.data.tgt_lang,
-        )
-    if is_main:
-        print(f"Vocab size: {tokenizer.vocab_size}")
+            print("\nLoading tokenizer...")
+        tokenizer_type = cfg.data.get("tokenizer_type", "custom")
+        tokenizer_path = cfg.data.get("tokenizer_path", "data/tokenizer/tokenizer.json")
 
-    # Override model vocab size from tokenizer
-    cfg.model.vocab_size = tokenizer.vocab_size
+        if tokenizer_type == "custom":
+            # RECOMMENDED: 32K BPE tokenizer for proper parameter allocation
+            tokenizer = create_tokenizer(
+                tokenizer_type="custom",
+                tokenizer_path=tokenizer_path,
+                max_length=cfg.data.max_src_length,
+            )
+            if is_main:
+                print(f"Using Custom 32K BPE tokenizer (RECOMMENDED)")
+        else:
+            # NOT RECOMMENDED: mBART 250K vocab makes model 95% embedding table
+            import warnings
+            if is_main:
+                warnings.warn(
+                    "Using mBART tokenizer (250K vocab). "
+                    "This makes the model 95% embedding table. "
+                    "Use tokenizer_type='custom' for thesis work."
+                )
+            tokenizer = NMTTokenizer(
+                src_lang=cfg.data.src_lang,
+                tgt_lang=cfg.data.tgt_lang,
+            )
+        if is_main:
+            print(f"Vocab size: {tokenizer.vocab_size}")
+
+        # Override model vocab size from tokenizer
+        cfg.model.vocab_size = tokenizer.vocab_size
 
     # Create model
     if is_main:
