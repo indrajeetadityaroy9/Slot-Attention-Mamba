@@ -18,10 +18,19 @@ from constants import PAD_TOKEN_ID, MQAR_VOCAB_SIZE
 
 
 def create_model(cfg: DictConfig, device: str, dtype: torch.dtype) -> HybridMambaEncoderDecoder:
-    """Instantiate model from Hydra config."""
+    """Instantiate model from Hydra config.
+
+    Adaptive parameters derived at runtime:
+    - hybrid_positions: From capacity theorem when num_pairs provided
+    - dropout: From capacity/data ratio when num_samples provided
+    """
     hybrid_positions = cfg.model.get("hybrid_positions")
     if hybrid_positions is not None:
         hybrid_positions = list(hybrid_positions)
+
+    # Extract data statistics for adaptive computation
+    num_pairs = cfg.data.get("num_pairs")  # For adaptive hybrid positions
+    num_samples = cfg.data.get("num_samples", 100000)  # For adaptive dropout
 
     model_cfg = ModelConfig(
         vocab_size=cfg.model.get("vocab_size", MQAR_VOCAB_SIZE),
@@ -31,14 +40,18 @@ def create_model(cfg: DictConfig, device: str, dtype: torch.dtype) -> HybridMamb
         d_state=cfg.model.d_state,
         n_heads=cfg.model.n_heads,
         hybrid_positions=hybrid_positions,
+        num_pairs=num_pairs,  # For adaptive hybrid position computation
+        num_samples=num_samples,  # For adaptive dropout computation
     )
 
     model = HybridMambaEncoderDecoder(config=model_cfg, device=device, dtype=dtype)
 
-    logger.info(f"Model: {model.num_parameters() / 1e6:.1f}M params")
-    logger.info(f"Encoder: {model.encoder.get_layer_counts()}")
-    logger.info(f"Decoder: {model.decoder.get_layer_counts()}")
-    logger.info(f"Hybrid positions: {sorted(list(model.decoder.hybrid_positions))}")
+    # Log model info
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Model: {num_params / 1e6:.1f}M params")
+    logger.info(f"Encoder: {model_cfg.encoder_layers} layers, {len(model.encoder.attention_positions)} attention")
+    logger.info(f"Decoder: {model_cfg.decoder_layers} layers, {len(model.decoder.hybrid_positions)} cross-attn")
+    logger.info(f"Hybrid positions: {sorted(model.decoder.hybrid_positions)}")
 
     return model
 
@@ -115,6 +128,9 @@ def main(cfg: DictConfig):
     model = create_model(cfg, str(device), dtype)
     train_loader, val_loader = create_dataloaders(cfg, dist_info["world_size"], dist_info["rank"])
 
+    # Pass num_samples for adaptive logging intervals computation
+    num_samples = cfg.data.get("num_samples", 100000)
+
     trainer = NMTTrainer(
         model=model,
         train_dataloader=train_loader,
@@ -125,6 +141,8 @@ def main(cfg: DictConfig):
         label_smoothing=cfg.training.get("label_smoothing"),
         output_dir=cfg.training.output_dir,
         eval_dataloader=val_loader,
+        dist_info=dist_info,
+        num_samples=num_samples,  # For adaptive logging intervals
     )
 
     if cfg.training.get("resume_from"):

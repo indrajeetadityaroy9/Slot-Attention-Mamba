@@ -91,6 +91,3 @@ class Mamba2BlockWrapper(nn.Module):
         ssm_state = torch.zeros(batch_size, d_inner, self.d_state, dtype=dtype, device=device)
 
         return conv_state, ssm_state
-
-    def extra_repr(self) -> str:
-        return f"d_model={self.d_model}, d_state={self.d_state}, d_conv={self.d_conv}, expand={self.expand}"

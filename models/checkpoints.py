@@ -3,12 +3,13 @@
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
 from .encoder_decoder import ModelConfig, HybridMambaEncoderDecoder
+from .utils import get_unwrapped_model
 
 
 def load_model_from_checkpoint(
@@ -25,19 +26,12 @@ def load_model_from_checkpoint(
 
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-    if not isinstance(checkpoint, dict):
+    if not isinstance(checkpoint, dict) or 'model_state_dict' not in checkpoint:
         raise ValueError(
-            "Invalid checkpoint format. Expected dict with 'model_state_dict' or 'model' key and 'config' field."
+            "Invalid checkpoint format. Expected dict with 'model_state_dict' and 'config' keys."
         )
 
-    if 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-    elif 'model' in checkpoint:
-        state_dict = checkpoint['model']
-    else:
-        raise ValueError(
-            "Invalid checkpoint format. Expected dict with 'model_state_dict' or 'model' key and 'config' field."
-        )
+    state_dict = checkpoint['model_state_dict']
 
     config_dict = checkpoint.get('config')
     if config_dict is None:
@@ -85,20 +79,9 @@ def save_checkpoint(
     world_size: int = 1,
 ) -> None:
     """Save checkpoint with embedded config for reproducibility."""
-    if hasattr(model, 'config'):
-        config = asdict(model.config)
-    elif hasattr(model, 'module') and hasattr(model.module, 'config'):
-        config = asdict(model.module.config)
-    else:
-        raise ValueError(
-            "Model does not have config attribute. "
-            "Publication-standard checkpoints require embedded config."
-        )
-
-    if hasattr(model, 'module'):
-        state_dict = model.module.state_dict()
-    else:
-        state_dict = model.state_dict()
+    unwrapped = get_unwrapped_model(model)
+    config = asdict(unwrapped.config)
+    state_dict = unwrapped.state_dict()
 
     checkpoint = {
         'config': config,
@@ -117,7 +100,7 @@ def save_checkpoint(
     if optimizer is not None:
         checkpoint['optimizer_state_dict'] = optimizer.state_dict()
 
-    if scheduler is not None and hasattr(scheduler, 'state_dict'):
+    if scheduler is not None:
         checkpoint['scheduler_state_dict'] = scheduler.state_dict()
 
     output_path = Path(output_path)

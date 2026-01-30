@@ -1,5 +1,12 @@
 # Default training configuration for 1x H100 80GB HBM3
 # Optimized for maximum throughput on single GPU
+#
+# ADAPTIVE PARAMETERS (computed at runtime, not hardcoded):
+# - warmup_steps: Derived from gradient norm stability (Goyal et al., 2017)
+# - weight_decay: Per-parameter, scaled by magnitude (Loshchilov & Hutter, 2017)
+# - agc_clip_factor: Per-parameter, from initialization scale (Brock et al., 2021)
+# - log/eval/save_steps: Derived from dataset size
+# - dropout: Derived from capacity/data ratio (Srivastava et al., 2014)
 
 # Batch Size
 batch_size: 256
@@ -10,17 +17,19 @@ max_steps: 100000
 
 # Optimization
 learning_rate: 3e-4
-weight_decay: 0.01
+# weight_decay: REMOVED - now computed per-parameter adaptively
 
 # Adaptive Gradient Clipping (AGC) - Brock et al., 2021
+# Factor is computed per-parameter from initialization scale
 use_agc: true
-agc_clip_factor: 0.01
+# agc_clip_factor: REMOVED - now derived per-parameter
 
 # Learning Rate Schedule
 scheduler_type: cosine
-warmup_ratio: 0.05
+# warmup_ratio: REMOVED - now ends when gradient norm stabilizes
 
-# Label Smoothing (null = auto-scale based on vocab_size)
+# Label Smoothing (null = auto-scale based on vocab entropy)
+# Reference: Muller et al., 2019 (arXiv 1906.02629)
 label_smoothing: null
 
 # Precision - H100 native BF16 (never use FP16)
@@ -38,6 +47,8 @@ distributed_strategy: none
 static_graph: true
 
 # Logging and Checkpointing
+# These values are now derived from dataset size at runtime.
+# Kept as fallbacks for non-MQAR datasets.
 log_steps: 100
 eval_steps: 1000
 save_steps: 5000

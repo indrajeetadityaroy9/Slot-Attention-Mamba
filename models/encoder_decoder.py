@@ -13,8 +13,9 @@ from .align_mamba import (
 )
 from ..constants import (
     PAD_TOKEN_ID, BOS_TOKEN_ID, EOS_TOKEN_ID,
-    DROPOUT, MAX_SEQ_LEN, MQAR_VOCAB_SIZE,
+    MAX_SEQ_LEN, MQAR_VOCAB_SIZE,
 )
+from ..training.adaptive import compute_adaptive_dropout
 
 
 @dataclass
@@ -22,8 +23,11 @@ class ModelConfig:
     """
     Configuration for the Hybrid Mamba-Attention model.
 
-    Simplified to essential parameters only. Infrastructure values
-    (dropout, max_seq_len, token IDs) use constants.
+    Adaptive parameters (computed from data/capacity):
+    - dropout: Derived from num_params / num_samples ratio
+    - hybrid_positions: Derived from capacity theorem when num_pairs provided
+
+    Reference: arXiv 2506.11891 (capacity theorem), Srivastava 2014 (dropout)
     """
     vocab_size: int = MQAR_VOCAB_SIZE
     d_model: int = 256
@@ -31,7 +35,9 @@ class ModelConfig:
     decoder_layers: int = 4
     d_state: int = 64
     n_heads: int = 8
-    hybrid_positions: Optional[List[int]] = None  # None = scale-invariant formula
+    hybrid_positions: Optional[List[int]] = None  # None = adaptive from capacity
+    num_pairs: Optional[int] = None  # For adaptive hybrid position computation
+    num_samples: Optional[int] = None  # For adaptive dropout computation
 
     @property
     def head_dim(self) -> int:
@@ -42,14 +48,15 @@ class HybridMambaEncoderDecoder(nn.Module):
     """
     Full Encoder-Decoder with Hybrid Mamba-Attention architecture.
 
-    Infrastructure values (dropout, max_seq_len, token IDs) are hardcoded
-    from constants.py to reduce configuration complexity.
+    Adaptive parameters (computed at construction):
+    - dropout: Derived from model capacity / data samples ratio
+      Reference: Srivastava et al., 2014 (JMLR 15(56):1929-1958)
+    - hybrid_positions: Derived from capacity theorem (arXiv 2506.11891)
     """
 
     def __init__(
         self,
         config: ModelConfig,
-        share_embeddings: bool = True,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
@@ -57,13 +64,23 @@ class HybridMambaEncoderDecoder(nn.Module):
         self.config = config
         factory_kwargs = {"device": device, "dtype": dtype}
 
+        # Compute adaptive dropout from capacity/data ratio
+        # Estimate num_params from architecture (rough upper bound)
+        estimated_params = (
+            config.vocab_size * config.d_model * 2 +  # Embeddings
+            config.encoder_layers * config.d_model * config.d_model * 4 +  # Encoder
+            config.decoder_layers * config.d_model * config.d_model * 4  # Decoder
+        )
+        num_samples = config.num_samples if config.num_samples else 100000  # Default
+        dropout = compute_adaptive_dropout(estimated_params, num_samples)
+
         self.encoder = HybridBiMambaEncoder(
             vocab_size=config.vocab_size,
             d_model=config.d_model,
             n_layers=config.encoder_layers,
             d_state=config.d_state,
             n_heads=config.n_heads,
-            dropout=DROPOUT,
+            dropout=dropout,
             max_seq_len=MAX_SEQ_LEN,
             pad_token_id=PAD_TOKEN_ID,
             **factory_kwargs,
@@ -76,14 +93,12 @@ class HybridMambaEncoderDecoder(nn.Module):
             d_state=config.d_state,
             n_heads=config.n_heads,
             hybrid_positions=config.hybrid_positions,
-            dropout=DROPOUT,
+            num_pairs=config.num_pairs,  # For adaptive position computation
+            dropout=dropout,
             max_seq_len=MAX_SEQ_LEN,
             pad_token_id=PAD_TOKEN_ID,
             **factory_kwargs,
         )
-
-        if share_embeddings:
-            self.decoder.embed.weight = self.encoder.embed.weight
 
     def forward(
         self,
@@ -127,29 +142,6 @@ class HybridMambaEncoderDecoder(nn.Module):
 
         return logits
 
-    def encode(
-        self,
-        src_ids: torch.Tensor,
-        src_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return self.encoder(src_ids, attention_mask=src_mask)
-
-    def init_generation_cache(
-        self,
-        encoder_out: torch.Tensor,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
-    ) -> Dict:
-        batch_size = encoder_out.size(0)
-        return self.decoder.init_cache(batch_size, encoder_out, device, dtype)
-
-    def generate_step(
-        self,
-        input_ids: torch.Tensor,
-        cache: Dict,
-    ) -> Tuple[torch.Tensor, Dict]:
-        return self.decoder.step(input_ids, cache)
-
     @torch.no_grad()
     def generate(
         self,
@@ -161,70 +153,44 @@ class HybridMambaEncoderDecoder(nn.Module):
         src_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Autoregressive generation. Returns (batch, gen_len)."""
-        if src_ids.size(1) > MAX_SEQ_LEN:
-            raise ValueError(
-                f"Source sequence length ({src_ids.size(1)}) exceeds max_seq_len ({MAX_SEQ_LEN})."
-            )
-
         batch_size = src_ids.size(0)
         device = src_ids.device
 
-        encoder_out = self.encode(src_ids, src_mask)
-        cache = self.init_generation_cache(encoder_out, device=device)
+        # Encode source directly
+        encoder_out = self.encoder(src_ids, attention_mask=src_mask)
+        cache = self.decoder.init_cache(batch_size, encoder_out, device=device)
 
-        generated = torch.full(
-            (batch_size, 1),
-            BOS_TOKEN_ID,
-            dtype=torch.long,
-            device=device,
-        )
-
+        generated = torch.full((batch_size, 1), BOS_TOKEN_ID, dtype=torch.long, device=device)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         for _ in range(max_length):
-            logits, cache = self.generate_step(generated[:, -1:], cache)
-            next_logits = logits[:, -1, :]
+            logits, cache = self.decoder.step(generated[:, -1:], cache)
+            next_logits = logits[:, -1, :] / temperature if temperature != 1.0 else logits[:, -1, :]
 
-            if temperature != 1.0:
-                next_logits = next_logits / temperature
+            if top_k is not None:
+                indices_to_remove = next_logits < torch.topk(next_logits, top_k)[0][..., -1, None]
+                next_logits = next_logits.masked_fill(indices_to_remove, float("-inf"))
+
+            if top_p is not None:
+                sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_mask = cumulative_probs > top_p
+                sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+                sorted_mask[..., 0] = 0
+                indices_to_remove = sorted_mask.scatter(1, sorted_indices, sorted_mask)
+                next_logits = next_logits.masked_fill(indices_to_remove, float("-inf"))
 
             if top_k is not None or top_p is not None:
-                next_token = self._sample_with_filtering(next_logits, top_k, top_p)
+                next_token = torch.multinomial(torch.softmax(next_logits, dim=-1), num_samples=1)
             else:
-                next_token = next_logits.argmax(dim=-1)
+                next_token = next_logits.argmax(dim=-1, keepdim=True)
 
-            next_token = next_token.unsqueeze(-1)
             generated = torch.cat([generated, next_token], dim=-1)
-
             finished = finished | (next_token.squeeze(-1) == EOS_TOKEN_ID)
             if finished.all():
                 break
 
         return generated
-
-    def _sample_with_filtering(
-        self,
-        logits: torch.Tensor,
-        top_k: Optional[int] = None,
-        top_p: Optional[float] = None,
-    ) -> torch.Tensor:
-        if top_k is not None:
-            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-            logits[indices_to_remove] = float("-inf")
-
-        if top_p is not None:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            logits[indices_to_remove] = float("-inf")
-
-        probs = torch.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-        return next_token
 
     def gradient_checkpointing_enable(self):
         self.encoder.gradient_checkpointing_enable()
@@ -233,15 +199,3 @@ class HybridMambaEncoderDecoder(nn.Module):
     def gradient_checkpointing_disable(self):
         self.encoder.gradient_checkpointing_disable()
         self.decoder.gradient_checkpointing_disable()
-
-    def num_parameters(self, only_trainable: bool = True) -> int:
-        if only_trainable:
-            return sum(p.numel() for p in self.parameters() if p.requires_grad)
-        return sum(p.numel() for p in self.parameters())
-
-    def extra_repr(self) -> str:
-        return (
-            f"vocab_size={self.config.vocab_size}, d_model={self.config.d_model}, "
-            f"encoder_layers={self.config.encoder_layers}, decoder_layers={self.config.decoder_layers}, "
-            f"params={self.num_parameters() / 1e6:.1f}M"
-        )

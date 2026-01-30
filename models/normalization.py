@@ -39,10 +39,5 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(d_model, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.is_cuda:
-            return fused_rmsnorm(x, self.weight, self.eps)
-        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return x * rms * self.weight
-
-    def extra_repr(self) -> str:
-        return f"{self.d_model}, eps={self.eps}"
+        assert x.is_cuda, "RMSNorm requires CUDA tensors"
+        return fused_rmsnorm(x, self.weight, self.eps)

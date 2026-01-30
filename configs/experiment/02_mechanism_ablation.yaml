@@ -16,7 +16,7 @@
 defaults:
   - override /data: mqar
   - override /model: hybrid_small
-  - override /training: default
+  - override /training: experiment_fast
 
 experiment_name: hybrid_placement_ablation
 
@@ -36,8 +36,3 @@ model:
 data:
   num_pairs: 128
   num_queries: 16
-
-training:
-  max_steps: 5000
-  batch_size: 64
-  learning_rate: 1e-4

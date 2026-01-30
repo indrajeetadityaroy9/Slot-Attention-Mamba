@@ -1,0 +1,16 @@
+# Fast training preset for MQAR experiments (5K steps)
+#
+# Used by experiment configs to avoid duplicating these values:
+#   - 01_proof_mqar_cliff
+#   - 02_mechanism_ablation
+#   - 04_d_state_scaling
+#
+# Inherits all other settings from default.yaml
+
+defaults:
+  - default
+
+# Override for fast experiment runs
+max_steps: 5000
+batch_size: 64
+learning_rate: 1e-4

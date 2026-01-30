@@ -14,8 +14,8 @@ vocab_size: 8192      # Total vocabulary size
 seq_length: 512       # Maximum sequence length
 mode: seq2seq         # seq2seq for encoder-decoder, decoder_only for pure Mamba
 
-# Samples
-num_samples: 10000
+# Samples (per Revisiting AR arXiv:2508.19029: "100,000 training samples")
+num_samples: 100000
 
 # Collation mode
 collator_mode: mqar

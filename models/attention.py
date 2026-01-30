@@ -1,5 +1,7 @@
 """Attention mechanisms for Hybrid Mamba-Attention architecture."""
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,6 +11,7 @@ from flash_attn import flash_attn_func, flash_attn_varlen_func
 
 from .normalization import RMSNorm
 from .embeddings import RotaryPositionalEmbedding
+from .base import broadcast_mask_for_sdpa
 
 
 class BidirectionalAttention(nn.Module):
@@ -87,13 +90,7 @@ class BidirectionalAttention(nn.Module):
 
             # SDPA for masked attention (supports arbitrary masks), FlashAttention otherwise
             if attention_mask is not None:
-                # attention_mask: (batch, seq_len) -> (batch, 1, 1, seq_len)
-                # SDPA broadcasts to (batch, n_heads, seq_len, seq_len)
-                attn_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-                assert attn_mask.dim() == 4, f"Mask must be 4D, got {attn_mask.dim()}D"
-                assert attn_mask.shape[0] == B, f"Mask batch dim {attn_mask.shape[0]} != {B}"
-                attn_mask = attn_mask.to(dtype=q.dtype)
-                attn_mask = (1.0 - attn_mask) * torch.finfo(q.dtype).min
+                attn_mask = broadcast_mask_for_sdpa(attention_mask, B, q.dtype)
 
                 q_sdpa = q.transpose(1, 2)
                 k_sdpa = k.transpose(1, 2)
@@ -111,9 +108,6 @@ class BidirectionalAttention(nn.Module):
             out = out.view(B, T, self.d_model)
             out = self.out_proj(out)
             return residual + out
-
-    def extra_repr(self) -> str:
-        return f"d_model={self.d_model}, n_heads={self.n_heads}, head_dim={self.head_dim}"
 
 
 class FlashCrossAttention(nn.Module):
@@ -160,7 +154,6 @@ class FlashCrossAttention(nn.Module):
             self.rope = None
 
         # Softmax scale for attention (sqrt(head_dim) is standard)
-        import math
         self.softmax_scale = math.sqrt(self.head_dim)
 
     def forward(
@@ -235,14 +228,7 @@ class FlashCrossAttention(nn.Module):
 
             # SDPA for masked attention, FlashAttention otherwise
             if encoder_padding_mask is not None:
-                # encoder_padding_mask: (batch, src_len) -> (batch, 1, 1, src_len)
-                # SDPA broadcasts to (batch, n_heads, tgt_len, src_len)
-                attn_mask = encoder_padding_mask.unsqueeze(1).unsqueeze(2)
-                assert attn_mask.dim() == 4, f"Mask must be 4D, got {attn_mask.dim()}D"
-                assert attn_mask.shape[0] == B, f"Mask batch dim {attn_mask.shape[0]} != {B}"
-                assert attn_mask.shape[-1] == T_enc, f"Mask src_len {attn_mask.shape[-1]} != {T_enc}"
-                attn_mask = attn_mask.to(dtype=q.dtype)
-                attn_mask = (1.0 - attn_mask) * torch.finfo(q.dtype).min
+                attn_mask = broadcast_mask_for_sdpa(encoder_padding_mask, B, q.dtype, src_len=T_enc)
 
                 q_sdpa = q.transpose(1, 2)
                 k_sdpa = k.transpose(1, 2)
@@ -266,9 +252,3 @@ class FlashCrossAttention(nn.Module):
             out = out.view(B, T_dec, self.d_model)
             out = self.out_proj(out)
             return residual + out
-
-    def extra_repr(self) -> str:
-        return (
-            f"d_model={self.d_model}, n_heads={self.n_heads}, head_dim={self.head_dim}, "
-            f"use_qk_norm={self.use_qk_norm}"
-        )

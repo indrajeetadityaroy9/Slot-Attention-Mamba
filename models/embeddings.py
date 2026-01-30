@@ -1,14 +1,64 @@
 """
-Positional Embeddings for Attention Layers.
+Embeddings for Align-Mamba models.
 
 Contains:
+- ScaledEmbedding: Token embedding with learnable scale and dropout (shared by encoder/decoder)
 - RotaryPositionalEmbedding (RoPE): Applied ONLY to attention layers, NOT Mamba.
   Mamba encodes position implicitly through recurrence.
 """
 
+import math
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
+
+
+class ScaledEmbedding(nn.Module):
+    """Token embedding with learnable scale and dropout.
+
+    Consolidates the embedding pattern used by both HybridBiMambaEncoder and
+    HybridMambaDecoder to eliminate code duplication.
+
+    The scale is initialized to sqrt(d_model) following the Transformer convention,
+    but is learnable to allow the model to adjust embedding magnitudes during training.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        padding_idx: int = 0,
+        dropout: float = 0.1,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        """
+        Args:
+            vocab_size: Size of the vocabulary
+            d_model: Embedding dimension
+            padding_idx: Index of padding token (default 0)
+            dropout: Dropout probability (default 0.1)
+            device: Device for parameters
+            dtype: Dtype for forward pass (embeddings are always float32, cast in forward)
+        """
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, d_model, padding_idx=padding_idx, device=device)
+        self.embed_scale = nn.Parameter(torch.tensor(math.sqrt(d_model)))
+        self.embed_dropout = nn.Dropout(dropout)
+        self.dtype = dtype
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            input_ids: Token indices of shape (batch, seq_len)
+
+        Returns:
+            Embeddings of shape (batch, seq_len, d_model)
+        """
+        x = self.embed(input_ids) * self.embed_scale
+        if self.dtype is not None:
+            x = x.to(self.dtype)
+        return self.embed_dropout(x)
 
 
 class RotaryPositionalEmbedding(nn.Module):
@@ -120,6 +170,3 @@ class RotaryPositionalEmbedding(nn.Module):
         k_rot = (k * cos_k) + (self._rotate_half(k) * sin_k)
 
         return q_rot, k_rot
-
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, max_seq_len={self.max_seq_len}, base={self.base}"

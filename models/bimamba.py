@@ -70,6 +70,3 @@ class BiMambaBlock(nn.Module):
         out = self.out_proj(out)
 
         return residual + out
-
-    def extra_repr(self) -> str:
-        return f"d_model={self.d_model}, d_state={self.d_state}, d_conv={self.d_conv}, expand={self.expand}, bidirectional=True"

@@ -16,6 +16,7 @@ from omegaconf import DictConfig
 
 from models.checkpoints import load_model_from_checkpoint
 from data.mqar import MQARDataset, MQARConfig
+from training.eval_utils import compute_batch_accuracy, compute_perplexity
 
 
 def evaluate_mqar(
@@ -40,55 +41,58 @@ def evaluate_mqar(
     total_tokens = 0
     total_sample_correct = 0
     total_samples = 0
+    total_perplexity_sum = 0.0
+    perplexity_batches = 0
 
     with torch.no_grad():
         for i in range(0, len(dataset), batch_size):
-            batch_indices = list(range(i, min(i + batch_size, len(dataset))))
-            batch = [dataset[j] for j in batch_indices]
+            batch = [dataset[j] for j in range(i, min(i + batch_size, len(dataset)))]
 
+            # Single forward pass for both accuracy and perplexity
             if mode == "decoder_only":
                 input_ids = torch.stack([b["input_ids"] for b in batch]).to(device)
                 labels = torch.stack([b["labels"] for b in batch]).to(device)
-
                 logits = model(None, input_ids)
-                predictions = logits.argmax(dim=-1)
-
-                mask = labels != -100
-                token_correct = ((predictions == labels) & mask).sum().item()
-                token_total = mask.sum().item()
-                sample_correct = ((predictions == labels) | ~mask).all(dim=-1).sum().item()
-
-            else:  # seq2seq mode
+            else:
                 src_ids = torch.stack([b["src_ids"] for b in batch]).to(device)
                 tgt_ids = torch.stack([b["tgt_ids"] for b in batch]).to(device)
                 labels = torch.stack([b["labels"] for b in batch]).to(device)
+                logits = model(src_ids, tgt_ids[:, :-1])
 
-                decoder_input = tgt_ids[:, :-1]
-                logits = model(src_ids, decoder_input)
-                predictions = logits.argmax(dim=-1)
+            predictions = logits.argmax(dim=-1)
+            mask = labels != -100
 
-                mask = labels != -100
-                token_correct = ((predictions == labels) & mask).sum().item()
-                token_total = mask.sum().item()
-                sample_correct = ((predictions == labels) | ~mask).all(dim=-1).sum().item()
-
-            total_token_correct += token_correct
-            total_tokens += token_total
-            total_sample_correct += sample_correct
+            tc, tt, sc = compute_batch_accuracy(predictions, labels, mask)
+            total_token_correct += tc
+            total_tokens += tt
+            total_sample_correct += sc
             total_samples += len(batch)
+
+            total_perplexity_sum += compute_perplexity(logits, labels)
+            perplexity_batches += 1
+
+    # Get hybrid positions from model config
+    hybrid_positions = getattr(model.config, "hybrid_positions", None)
+    if hybrid_positions is not None:
+        hybrid_positions = sorted(list(hybrid_positions))
 
     return {
         "token_accuracy": total_token_correct / max(total_tokens, 1),
         "sample_accuracy": total_sample_correct / max(total_samples, 1),
+        "perplexity": total_perplexity_sum / max(perplexity_batches, 1),
         "num_samples": total_samples,
         "num_pairs": config.num_pairs,
         "d_state": getattr(model.config, "d_state", None),
+        "hybrid_positions": hybrid_positions,
     }
 
 
 @hydra.main(config_path="configs", config_name="config", version_base=None)
 def main(cfg: DictConfig):
     """Run evaluation pipeline."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for evaluation. No CUDA devices found.")
+
     print("=" * 60)
     print("State Capacity Evaluation")
     print("=" * 60)
@@ -108,17 +112,15 @@ def main(cfg: DictConfig):
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Loaded model: {param_count / 1e6:.1f}M parameters")
 
-    # Get dataset config
+    # Get dataset config - MQARConfig only has num_pairs and num_queries
+    # (vocab_size and seq_length are defined in constants.py)
     data_cfg = cfg.get("data", {})
-    mqar_cfg = data_cfg.get("mqar", {})
 
     config = MQARConfig(
-        vocab_size=data_cfg.get("vocab_size", mqar_cfg.get("vocab_size", 8192)),
-        num_pairs=data_cfg.get("num_pairs", mqar_cfg.get("num_pairs", 64)),
-        num_queries=data_cfg.get("num_queries", mqar_cfg.get("num_queries", 16)),
-        seq_length=data_cfg.get("seq_length", mqar_cfg.get("seq_length", 512)),
+        num_pairs=data_cfg.get("num_pairs", 64),
+        num_queries=data_cfg.get("num_queries", 16),
     )
-    mqar_mode = data_cfg.get("mode", mqar_cfg.get("mode", "seq2seq"))
+    mqar_mode = data_cfg.get("mode", "seq2seq")
 
     print(f"\nMQAR Config: num_pairs={config.num_pairs}, num_queries={config.num_queries}, mode={mqar_mode}")
 
@@ -135,11 +137,15 @@ def main(cfg: DictConfig):
         mode=mqar_mode,
     )
 
+    # Add seed to results for multi-seed aggregation
+    results["seed"] = cfg.project.get("seed") if cfg.get("project") else None
+
     print("\n" + "=" * 60)
     print("RESULTS")
     print("=" * 60)
     print(f"Token Accuracy:  {results['token_accuracy']*100:.2f}%")
     print(f"Sample Accuracy: {results['sample_accuracy']*100:.2f}%")
+    print(f"Perplexity:      {results['perplexity']:.2f}")
 
     # Save results
     output_dir = Path(cfg.get("output_dir", "outputs/evaluation"))

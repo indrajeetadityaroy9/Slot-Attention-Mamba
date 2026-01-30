@@ -4,7 +4,6 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.optim.lr_scheduler import LRScheduler
 
 from kernels.loss import fused_cross_entropy_loss
@@ -23,46 +22,20 @@ class LabelSmoothingCrossEntropy(nn.Module):
         self.smoothing = smoothing
         self.ignore_index = ignore_index
         self.reduction = reduction
-        self.confidence = 1.0 - smoothing
 
     def forward(
         self,
         logits: torch.Tensor,
         targets: torch.Tensor,
     ) -> torch.Tensor:
-        if logits.is_cuda:
-            return fused_cross_entropy_loss(
-                logits,
-                targets,
-                smoothing=self.smoothing,
-                ignore_index=self.ignore_index,
-                reduction=self.reduction,
-            )
-
-        if logits.dim() == 3:
-            logits = logits.view(-1, logits.size(-1))
-            targets = targets.view(-1)
-
-        vocab_size = logits.size(-1)
-        mask = targets != self.ignore_index
-        valid_targets = targets.clone()
-        valid_targets[~mask] = 0
-
-        log_probs = F.log_softmax(logits, dim=-1)
-
-        with torch.no_grad():
-            smooth_targets = torch.zeros_like(log_probs)
-            smooth_targets.fill_(self.smoothing / (vocab_size - 1))
-            smooth_targets.scatter_(1, valid_targets.unsqueeze(1), self.confidence)
-
-        loss = -torch.sum(log_probs * smooth_targets, dim=-1)
-        loss = loss * mask.float()
-
-        if self.reduction == "mean":
-            return loss.sum() / mask.sum().clamp(min=1)
-        elif self.reduction == "sum":
-            return loss.sum()
-        return loss
+        assert logits.is_cuda, "LabelSmoothingCrossEntropy requires CUDA tensors"
+        return fused_cross_entropy_loss(
+            logits,
+            targets,
+            smoothing=self.smoothing,
+            ignore_index=self.ignore_index,
+            reduction=self.reduction,
+        )
 
 
 class CosineAnnealingWarmupScheduler(LRScheduler):

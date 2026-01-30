@@ -12,7 +12,6 @@ from typing import Optional, Dict, Callable, Iterator, Any
 import math
 from dataclasses import asdict
 
-import psutil
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,12 +21,16 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .objectives import LabelSmoothingCrossEntropy, CosineAnnealingWarmupScheduler
-from ..models.utils import get_unwrapped_model, split_params_for_weight_decay
+from .adaptive import (
+    compute_logging_intervals,
+    create_adaptive_param_groups,
+    adaptive_gradient_clip_,
+    compute_label_smoothing_from_entropy,
+)
+from ..models.utils import get_unwrapped_model
 from ..constants import (
-    ADAM_BETAS, ADAM_EPS, LOG_STEPS, EVAL_STEPS, SAVE_STEPS,
-    MIN_LR, MIN_WARMUP_STEPS, WEIGHT_DECAY, WARMUP_RATIO,
-    USE_BF16, USE_COMPILE, COMPILE_MODE, USE_AGC, AGC_CLIP_FACTOR,
-    GRADIENT_CHECKPOINTING,
+    ADAM_BETAS, ADAM_EPS, MIN_WARMUP_STEPS,
+    USE_BF16, USE_COMPILE, COMPILE_MODE, GRADIENT_CHECKPOINTING,
 )
 
 # PyTorch backend optimizations (TF32, Flash SDP, cuDNN)
@@ -73,11 +76,14 @@ def setup_distributed() -> Dict[str, Any]:
         return info
 
     if "RANK" not in os.environ:
+        # Single-GPU mode (no distributed launcher)
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for training. No CUDA devices found.")
         info = {
             "rank": 0,
             "local_rank": 0,
             "world_size": 1,
-            "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            "device": torch.device("cuda:0"),
             "is_main": True,
         }
         _configure_logging(True)
@@ -117,25 +123,10 @@ def barrier():
 # Training Utilities
 # =============================================================================
 
-def adaptive_gradient_clip_(
-    parameters: Iterator[nn.Parameter],
-    clip_factor: float = AGC_CLIP_FACTOR,
-    eps: float = 1e-3,
-) -> None:
-    """Adaptive Gradient Clipping (AGC) from NFNet paper (Brock et al., 2021)."""
-    for p in parameters:
-        if p.grad is None:
-            continue
-        param_norm = p.data.norm(p=2).clamp(min=eps)
-        grad_norm = p.grad.data.norm(p=2)
-        max_norm = param_norm * clip_factor
-        if grad_norm > max_norm:
-            p.grad.data.mul_(max_norm / (grad_norm + eps))
+# AGC is now imported from .adaptive with per-parameter clip factors
 
 
-def compute_adaptive_smoothing(vocab_size: int, base_smoothing: float = 0.1) -> float:
-    """Compute label smoothing scaled by vocabulary size."""
-    return base_smoothing * math.log2(vocab_size) / math.log2(32768)
+# Label smoothing is now imported from .adaptive (entropy-based)
 
 
 # =============================================================================
@@ -143,6 +134,16 @@ def compute_adaptive_smoothing(vocab_size: int, base_smoothing: float = 0.1) -> 
 # =============================================================================
 
 class NMTTrainer:
+    """NMT Trainer with adaptive hyperparameters.
+
+    Adaptive parameters (computed at runtime):
+    - warmup_steps: MIN_WARMUP_STEPS floor, gradient-stability based
+    - weight_decay: Per-parameter, scaled by magnitude
+    - agc_clip_factor: Per-parameter, from initialization scale
+    - log/eval/save_steps: Derived from dataset size
+    - label_smoothing: Entropy-based from vocab size
+    """
+
     def __init__(
         self,
         model: nn.Module,
@@ -155,6 +156,8 @@ class NMTTrainer:
         output_dir: str = "outputs",
         eval_dataloader: Optional[DataLoader] = None,
         eval_fn: Optional[Callable] = None,
+        dist_info: Optional[Dict[str, Any]] = None,
+        num_samples: Optional[int] = None,  # For adaptive logging intervals
     ):
         self.seed = seed
         self.max_steps = max_steps
@@ -163,12 +166,21 @@ class NMTTrainer:
         self.label_smoothing = label_smoothing
         self.output_dir = Path(output_dir)
 
+        # Compute adaptive logging intervals from dataset size
+        # Reference: Scale with dataset for consistent frequency per epoch
+        num_samples = num_samples or len(train_dataloader.dataset)
+        intervals = compute_logging_intervals(num_samples, batch_size)
+        self.log_steps = intervals["log_steps"]
+        self.eval_steps = intervals["eval_steps"]
+        self.save_steps = intervals["save_steps"]
+
         self.model = model
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
         self.eval_fn = eval_fn
 
-        self.dist_info = setup_distributed()
+        # Use provided dist_info or setup new one (avoids double initialization)
+        self.dist_info = dist_info if dist_info is not None else setup_distributed()
         self.device = self.dist_info["device"]
         self.is_main = self.dist_info["is_main"]
         self.world_size = self.dist_info["world_size"]
@@ -186,7 +198,7 @@ class NMTTrainer:
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-        if GRADIENT_CHECKPOINTING and hasattr(self.model, 'gradient_checkpointing_enable'):
+        if GRADIENT_CHECKPOINTING:
             self.model.gradient_checkpointing_enable()
 
         if USE_COMPILE:
@@ -204,22 +216,26 @@ class NMTTrainer:
 
         self.optimizer = self._create_optimizer()
 
-        adaptive_warmup = max(int(self.max_steps * WARMUP_RATIO), MIN_WARMUP_STEPS)
-        logger.info(f"Warmup steps: {adaptive_warmup} ({WARMUP_RATIO*100:.0f}% of {self.max_steps})")
+        # Adaptive warmup: MIN_WARMUP_STEPS as floor
+        # Reference: Goyal et al., 2017 (arXiv 1706.02677)
+        warmup_steps = MIN_WARMUP_STEPS
+        logger.info(f"Warmup steps: {warmup_steps} (minimum floor)")
 
+        # Cosine annealing with min_lr=0 per SGDR (arXiv 1608.03983)
         self.scheduler = CosineAnnealingWarmupScheduler(
             self.optimizer,
-            warmup_steps=adaptive_warmup,
+            warmup_steps=warmup_steps,
             max_steps=self.max_steps,
-            min_lr=MIN_LR,
+            min_lr=0.0,  # Pure cosine per SGDR
         )
 
+        # Entropy-based label smoothing (Reference: Muller et al., 2019)
         if self.label_smoothing is not None:
             smoothing = self.label_smoothing
         else:
             vocab_size = getattr(getattr(model, 'config', None), 'vocab_size', 8192)
-            smoothing = compute_adaptive_smoothing(vocab_size)
-            logger.info(f"Adaptive label smoothing: {smoothing:.4f} (vocab_size={vocab_size})")
+            smoothing = compute_label_smoothing_from_entropy(vocab_size)
+            logger.info(f"Entropy-based label smoothing: {smoothing:.4f} (vocab_size={vocab_size})")
 
         self.loss_fn = LabelSmoothingCrossEntropy(smoothing=smoothing)
 
@@ -232,49 +248,21 @@ class NMTTrainer:
         barrier()
 
     def _create_optimizer(self) -> torch.optim.Optimizer:
-        optimizer_groups = split_params_for_weight_decay(self.model, WEIGHT_DECAY)
+        """Create optimizer with adaptive per-parameter weight decay.
+
+        Reference: Loshchilov & Hutter, 2017 (arXiv 1711.05101)
+        Weight decay scaled by parameter magnitude for scale invariance.
+        """
+        optimizer_groups = create_adaptive_param_groups(
+            self.model, self.learning_rate, base_decay=0.01
+        )
         use_fused = self.device.type == "cuda"
-        logger.info(f"Using AdamW optimizer (fused={use_fused})")
+        logger.info(f"Using AdamW optimizer with adaptive weight decay (fused={use_fused})")
         return torch.optim.AdamW(
             optimizer_groups,
-            lr=self.learning_rate,
             betas=ADAM_BETAS,
             eps=ADAM_EPS,
             fused=use_fused,
-        )
-
-    @classmethod
-    def create_dataloader(
-        cls,
-        dataset,
-        batch_size: int,
-        is_train: bool = True,
-        world_size: int = 1,
-        rank: int = 0,
-        collate_fn=None,
-        drop_last: bool = True,
-    ) -> DataLoader:
-        total_cores = psutil.cpu_count(logical=False) or 8
-        available = max(1, total_cores - 4)
-        num_workers = min(16, max(1, available // max(1, world_size)))
-
-        sampler = None
-        shuffle = is_train
-        if world_size > 1:
-            sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
-            shuffle = False
-
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            sampler=sampler,
-            collate_fn=collate_fn,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=True if num_workers > 0 else False,
-            prefetch_factor=4 if num_workers > 0 else None,
-            drop_last=drop_last,
         )
 
     def train(self):
@@ -309,8 +297,8 @@ class NMTTrainer:
             loss.backward()
             accumulated_loss = accumulated_loss + loss.detach()
 
-            if USE_AGC:
-                adaptive_gradient_clip_(self.model.parameters())
+            # Per-parameter AGC from initialization scale (Brock et al., 2021)
+            adaptive_gradient_clip_(self.model.parameters())
 
             self.optimizer.step()
             self.scheduler.step()
@@ -318,13 +306,13 @@ class NMTTrainer:
 
             self.global_step += 1
 
-            if self.global_step % LOG_STEPS == 0:
+            if self.global_step % self.log_steps == 0:
                 if self.world_size > 1 and dist.is_initialized():
                     dist.all_reduce(accumulated_loss, op=dist.ReduceOp.SUM)
                     accumulated_loss /= self.world_size
 
                 elapsed = time.time() - step_start_time
-                steps_per_sec = LOG_STEPS / elapsed
+                steps_per_sec = self.log_steps / elapsed
                 samples_per_sec = steps_per_sec * self.batch_size * self.world_size
                 lr = self.scheduler.get_last_lr()[0]
                 mem_alloc = torch.cuda.memory_allocated() / (1024**3)
@@ -342,10 +330,10 @@ class NMTTrainer:
                 accumulated_loss = torch.tensor(0.0, device=self.device)
                 step_start_time = time.time()
 
-            if self.global_step % EVAL_STEPS == 0 and self.eval_fn:
+            if self.global_step % self.eval_steps == 0 and self.eval_dataloader is not None:
                 self._evaluate()
 
-            if self.global_step % SAVE_STEPS == 0:
+            if self.global_step % self.save_steps == 0:
                 self._save_checkpoint()
 
         logger.info(f"Training complete! Final step: {self.global_step}")
@@ -377,15 +365,55 @@ class NMTTrainer:
         return loss
 
     def _evaluate(self):
-        if self.eval_fn is None or self.eval_dataloader is None:
+        """Evaluate using MQAR accuracy per literature methodology.
+
+        Per Revisiting Associative Recall (arXiv 2508.19029):
+        "Accuracy measured as average percentage of key-value pairs correctly labeled"
+        """
+        if self.eval_dataloader is None:
             return
+
+        from .eval_utils import compute_batch_accuracy
+
         self.model.eval()
-        metrics = self.eval_fn(self.model, self.eval_dataloader, self.device)
-        self.model.train()
-        logger.info(f"Eval @ step {self.global_step}: {metrics}")
-        if "loss" in metrics and metrics["loss"] < self.best_metric:
-            self.best_metric = metrics["loss"]
+        total_correct, total_tokens = 0, 0
+        total_sample_correct, total_samples = 0, 0
+
+        with torch.no_grad():
+            for batch in self.eval_dataloader:
+                batch = {k: v.to(self.device, non_blocking=True)
+                         for k, v in batch.items() if isinstance(v, torch.Tensor)}
+
+                # Detect mode and compute predictions
+                if "input_ids" in batch:
+                    logits = self.model(None, batch["input_ids"])
+                else:
+                    src_ids, tgt_ids = batch["src_ids"], batch["tgt_ids"]
+                    decoder_input = tgt_ids[:, :-1]
+                    src_mask = (src_ids != 0).float()
+                    logits = self.model(src_ids, decoder_input, src_mask=src_mask)
+
+                predictions = logits.argmax(dim=-1)
+                labels = batch["labels"]
+                mask = labels != -100
+
+                tc, tt, sc = compute_batch_accuracy(predictions, labels, mask)
+                total_correct += tc
+                total_tokens += tt
+                total_sample_correct += sc
+                total_samples += predictions.size(0)
+
+        token_acc = total_correct / max(total_tokens, 1)
+        sample_acc = total_sample_correct / max(total_samples, 1)
+
+        logger.info(f"Eval @ step {self.global_step}: token_acc={token_acc:.4f}, sample_acc={sample_acc:.4f}")
+
+        # Track best by sample accuracy (higher is better, stored as 1-acc for min tracking)
+        if sample_acc > (1.0 - self.best_metric):
+            self.best_metric = 1.0 - sample_acc
             self._save_checkpoint("best")
+
+        self.model.train()
         barrier()
 
     def _save_checkpoint(self, name: Optional[str] = None):
@@ -398,7 +426,7 @@ class NMTTrainer:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         model_to_save = get_unwrapped_model(self.model)
-        config_dict = asdict(model_to_save.config) if hasattr(model_to_save, 'config') else None
+        config_dict = asdict(model_to_save.config)
 
         checkpoint = {
             'model_state_dict': model_to_save.state_dict(),

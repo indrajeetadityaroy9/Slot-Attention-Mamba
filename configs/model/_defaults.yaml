@@ -1,5 +1,11 @@
 # Model defaults - inherited by all model configs
 # Token IDs and Mamba parameters are in constants.py
+#
+# ADAPTIVE PARAMETERS (null = computed at runtime):
+# - d_state: Architecture parameter (set explicitly per experiment)
+# - attention_ratio: Derived from receptive field saturation
+# - hybrid_positions: Derived from capacity theorem (arXiv 2506.11891)
+# - dropout: Derived from capacity/data ratio (Srivastava et al., 2014)
 
 # Adaptive parameters (null = auto-computed)
 d_state: null
@@ -10,7 +16,9 @@ hybrid_positions: null
 head_dim: 64
 
 # Regularization
-dropout: 0.1
+# dropout: null = computed from num_params / num_samples ratio
+# Reference: Srivastava et al., 2014 (JMLR 15(56):1929-1958)
+dropout: null
 
 # Positional encoding
 max_seq_len: 8192
