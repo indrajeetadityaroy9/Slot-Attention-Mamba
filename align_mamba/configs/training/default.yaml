@@ -1,9 +1,0 @@
-# Training configuration
-
-batch_size: 256
-gradient_accumulation_steps: 1
-max_steps: 100000
-learning_rate: 3e-4
-label_smoothing: null
-output_dir: outputs
-resume_from: null

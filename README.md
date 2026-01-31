@@ -1,146 +1,129 @@
-# Align-Mamba: State Capacity Limits in Selective SSMs
+# Polar-Mem-Mamba
 
-This codebase investigates the **state capacity limitations** of Selective State Space Models (Mamba) and demonstrates how **Hybrid Mamba-Attention** architectures overcome these limitations through strategic cross-attention placement.
+State capacity limits in Selective SSMs and how the **Polar-Mem-Mamba** architecture overcomes them.
 
-## Research Hypothesis
+## Core Thesis
 
-### 1. The State Capacity Problem
+Pure Mamba decoders have limited state capacity (~d_state tokens). When the number of key-value pairs exceeds d_state, accuracy collapses (the "capacity cliff"). Polar-Mem-Mamba combines three orthogonal innovations to overcome this limitation.
 
-Pure Mamba decoders have limited "state capacity" - they can only reliably store and retrieve approximately **d_state tokens** (typically 64) worth of key-value associations. When the number of associations exceeds this limit, accuracy degrades sharply - we call this the **"Capacity Cliff"**.
+## Architecture
 
-### 2. The Solution: Hybrid Cross-Attention
+Three mechanisms addressing distinct forgetting pathways:
 
-Hybrid Mamba-Attention models solve this by offloading retrieval to cross-attention layers:
-- The **encoder** (bidirectional Mamba) stores key-value pairs
-- The **decoder** uses cross-attention at strategic positions to retrieve from the encoder
-- This allows accurate retrieval far beyond d_state capacity
+| Forgetting Pathway | Mechanism | Solution | Reference |
+|--------------------|-----------|----------|-----------|
+| Intra-layer recency | Exponential decay overwrites old tokens | Polarized channels (A=0/A=1) | [Polarized Mamba](https://arxiv.org/abs/2501.00658) |
+| Inter-layer loss | Information lost across layer transitions | Cross-layer memory pool | [MemMamba](https://arxiv.org/abs/2510.03279) |
+| State overflow | Fixed d_state capacity | Strategic cross-attention | [Samba](https://arxiv.org/abs/2506.11891) |
 
-### 3. The "Blind Start" Problem
+### Block Types
 
-A critical finding: **Layer 0 cross-attention is essential**. Without it, the decoder starts "blind" - it cannot create contextualized queries for later cross-attention layers. Configurations with cross-attention only at later layers (e.g., `[8, 16]`) fail completely.
+| Type | Components | Use Case |
+|------|------------|----------|
+| `mamba2` | Pure Mamba2 | Baseline |
+| `polarized` | Mamba2 + A=0/A=1 fusion | Recency mitigation |
+| `memmamba` | Mamba2 + memory pool | Long-range retrieval |
+| `polarized_mem` | All components (default) | Full SOTA |
 
-## Quick Start
+## Usage
 
 ```bash
 # Install
 pip install -e .
 
-# Run capacity cliff experiment (Hybrid should succeed, Pure Mamba should fail)
-python -m align_mamba experiment=01_proof_mqar_cliff \
-    model.hybrid_positions=[0,2] data.mqar.num_pairs=128
+# Train with defaults
+align-mamba --num_pairs 128 --seed 42
 
-# Run Blind Start ablation
-python -m align_mamba -m experiment=02_mechanism_ablation \
-    'model.hybrid_positions=[],[0],[0,2],[8,16]'
+# Train with ablation config
+align-mamba --config align_mamba/configs/ablation/a7_full.yaml
+
+# Evaluate
+align-eval --checkpoint outputs/best --num_pairs 128
+
+# Capacity cliff analysis
+align-eval --checkpoint outputs/best --capacity_cliff
 ```
-
-## Experiments
-
-| Experiment | Config | Purpose |
-|------------|--------|---------|
-| **01_proof_mqar_cliff** | `experiment=01_proof_mqar_cliff` | Prove the capacity cliff: pure Mamba fails at `num_pairs > d_state`, hybrid succeeds |
-| **02_mechanism_ablation** | `experiment=02_mechanism_ablation` | Prove Layer 0 is critical: `[8,16]` fails, `[0]` succeeds |
-| **04_d_state_scaling** | `experiment=04_d_state_scaling` | Validate that capacity scales as O(d_state) |
-
-### Expected Results (num_pairs=128, d_state=64)
-
-| Configuration | Expected Accuracy |
-|---------------|-------------------|
-| Pure Mamba `[]` | ~0% (state overflow) |
-| Layer 0 only `[0]` | ~85-90% |
-| Minimal hybrid `[0,2]` | ~95% |
-| No Layer 0 `[8,16]` | ~0% (proves Blind Start) |
-
-## Terminology
-
-| Term | Meaning |
-|------|---------|
-| **d_state** | Mamba's internal state dimension (default 64, creates capacity cliff) |
-| **hybrid_positions** | Decoder layers with cross-attention (e.g., `[0, 2]`) |
-| **num_pairs** | Number of key-value pairs in MQAR task |
-| **seq2seq mode** | Encoder-decoder with cross-attention (tests offloading hypothesis) |
-| **decoder_only mode** | Pure Mamba (tests raw state capacity) |
-
-## MQAR Synthetic Task
-
-The **Multi-Query Associative Recall (MQAR)** task is a controlled benchmark for state capacity:
-
-```
-Encoder: [BOS, k1, :, v1, k2, :, v2, ..., kN, :, vN, EOS]
-Decoder: [BOS, k3, k7, ..., EOS]
-Output:  Model must predict values v3, v7, ... for queried keys
-```
-
-When `num_pairs > d_state`, pure Mamba "overflows" and cannot recall values correctly.
-
-## Architecture
-
-```
-Encoder (Bidirectional Mamba)         Decoder (Unidirectional Mamba + Cross-Attn)
-┌─────────────────────────────┐      ┌─────────────────────────────────────────┐
-│  BiMamba Block 0            │      │  HybridBlock 0 (Mamba + Cross-Attn)     │ ← "Blind Start" fix
-│  BiMamba Block 1            │  →   │  MambaBlock 1                           │
-│  Attention Block 2          │  →   │  HybridBlock 2 (Mamba + Cross-Attn)     │
-│  BiMamba Block 3            │      │  MambaBlock 3                           │
-└─────────────────────────────┘      └─────────────────────────────────────────┘
-         ↓                                          ↓
-   Key-Value Store                        Query + Retrieve → Logits
-```
-
-**HybridBlock**: Mamba runs first to create contextualized queries, then cross-attention retrieves from encoder.
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `align_mamba/models/align_mamba.py` | HybridBlock, HybridBiMambaEncoder, HybridMambaDecoder |
-| `align_mamba/models/encoder_decoder.py` | ModelConfig, HybridMambaEncoderDecoder wrapper |
-| `align_mamba/data/mqar.py` | MQAR dataset for state capacity testing |
-| `align_mamba/training/trainer.py` | NMTTrainer with full training loop |
-| `align_mamba/configs/experiment/` | Pre-configured experiments |
 
 ## Configuration
 
-Uses [Hydra](https://hydra.cc/) for configuration composition:
+Minimal config surface (17 parameters) for publication-grade experiments:
 
+```python
+from align_mamba import Config, HybridMambaEncoderDecoder
+
+config = Config(
+    # Core research parameters
+    d_state=64,                  # Capacity cliff at this value
+    num_pairs=128,               # Exceeds d_state to test capacity
+    block_type="polarized_mem",  # mamba2 | polarized | memmamba | polarized_mem
+
+    # Architecture
+    encoder_layers=6,            # 0 for decoder-only
+    hybrid_positions=[0, 2],     # Cross-attention layers
+)
+
+model = HybridMambaEncoderDecoder.from_config(config, "cuda", torch.bfloat16)
+```
+
+**Fixed values** (not configurable): `vocab_size=8192`, `label_smoothing` (auto-computed), `num_workers=8`.
+
+## Ablation Study (A0-A7)
+
+| Config | Polarized | Memory | Cross-Attn | Expected Result |
+|--------|:---------:|:------:|:----------:|-----------------|
+| A0 | - | - | - | Capacity cliff at d_state |
+| A1 | ✓ | - | - | Better recency, still capacity-limited |
+| A2 | - | ✓ | - | Better long-range retention |
+| A3 | - | - | ✓ | Retrieval beyond d_state |
+| A4 | ✓ | ✓ | - | Best decoder-only |
+| A5 | ✓ | - | ✓ | Recency + retrieval |
+| A6 | - | ✓ | ✓ | Long-range + retrieval |
+| A7 | ✓ | ✓ | ✓ | **Full SOTA** |
+
+Run ablations:
 ```bash
-# Default config
-python -m align_mamba
-
-# Override parameters
-python -m align_mamba model.d_state=128 data.mqar.num_pairs=256
-
-# Use experiment preset
-python -m align_mamba experiment=01_proof_mqar_cliff
-
-# Multi-seed sweep (Hydra multirun)
-python -m align_mamba -m experiment=01_proof_mqar_cliff \
-    project.seed=42,1337,2024 \
-    model.hybrid_positions=[],[0,2]
+for i in {0..7}; do
+  align-mamba --config align_mamba/configs/ablation/a${i}_*.yaml
+done
 ```
 
-## Hardware Requirements
+## MQAR Task
 
-Optimized for **NVIDIA H100 80GB**:
-- BF16 precision (never FP16)
-- `torch.compile` with `max-autotune`
-- Fused optimizer, TF32 matmul
-- Batch size 256 for single H100
-
-## Dependencies
+Multi-Query Associative Recall benchmark for state capacity:
 
 ```
-torch>=2.3.0
-mamba-ssm>=2.0
-flash-attn>=2.5
-hydra-core>=1.3
-causal-conv1d>=1.2
+Encoder: [BOS k1:v1 k2:v2 ... kN:vN EOS]
+Decoder: [BOS k3 k7 ... EOS]
+Target:  [v3 v7 ...]
 ```
 
-## License
+Token vocabulary: keys 10-4095, values 4096-8191.
 
-[Add license information]
+## Structure
 
-## Citation
+```
+align_mamba/
+├── config.py           # Configuration (17 params)
+├── model.py            # Encoder, decoder, all block types
+├── train.py            # Distributed training
+├── evaluate.py         # Evaluation + capacity cliff
+├── data.py             # MQAR dataset
+├── configs/ablation/   # A0-A7 ablation configs
+└── kernels/            # Fused Triton kernels
+```
 
-[Add paper citation when available]
+## Requirements
+
+- PyTorch >= 2.3
+- mamba-ssm >= 2.0
+- flash-attn >= 2.5
+- causal-conv1d >= 1.2
+- triton >= 2.1
+
+## References
+
+- [Polarized Mamba](https://arxiv.org/abs/2501.00658) - A=0/A=1 channels for recency bias (ICLR 2025)
+- [MemMamba](https://arxiv.org/abs/2510.03279) - Cross-layer memory pool
+- [Samba](https://arxiv.org/abs/2506.11891) - Strategic attention placement for capacity
+- [Mamba-2](https://arxiv.org/abs/2405.21060) - State space duality (ICML 2024)
+- [Jamba](https://arxiv.org/abs/2403.19887) - Hybrid Mamba-attention architecture

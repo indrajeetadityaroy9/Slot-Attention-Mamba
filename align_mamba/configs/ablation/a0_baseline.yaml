@@ -1,0 +1,25 @@
+# A0: Pure Mamba Baseline
+# No polarization, no memory, no cross-attention
+# Expected: Capacity cliff at num_pairs > d_state
+
+block_type: mamba2
+encoder_layers: 0
+hybrid_positions: []
+
+# Architecture
+d_model: 256
+decoder_layers: 6
+d_state: 64
+n_heads: 4
+
+# Training
+batch_size: 256
+max_steps: 50000
+learning_rate: 3e-4
+
+# Data (capacity test)
+num_pairs: 128
+num_queries: 16
+num_samples: 100000
+
+output_dir: outputs/ablation/a0_baseline

@@ -1,0 +1,25 @@
+# A5: Polarized + Cross-Attention
+# A=0/A=1 channels with encoder cross-attention
+# Expected: Recency + retrieval, no memory pool
+
+block_type: polarized
+encoder_layers: 6
+hybrid_positions: [0, 2]
+
+# Architecture
+d_model: 256
+decoder_layers: 6
+d_state: 64
+n_heads: 4
+
+# Training
+batch_size: 256
+max_steps: 50000
+learning_rate: 3e-4
+
+# Data (capacity test)
+num_pairs: 128
+num_queries: 16
+num_samples: 100000
+
+output_dir: outputs/ablation/a5_polar_attn
