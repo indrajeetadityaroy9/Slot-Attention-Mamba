@@ -1,0 +1,46 @@
+# @package _global_
+#
+# KL-Guided Layer Selection Experiment
+#
+# PURPOSE: Compare heuristic vs KL-guided cross-attention placement
+# - Heuristic: compute_hybrid_positions_adaptive (capacity-based)
+# - KL-Guided: Post-training refinement via KL divergence
+#
+# Reference: arXiv:2512.20569
+# "Optimal Cross-Attention Placement via KL-Guided Selection"
+#
+# USAGE:
+#   # Train baseline with all positions
+#   python -m align_mamba.train experiment=07_kl_guided
+#
+#   # Run KL calibration after training
+#   python -m align_mamba.kl_calibrate checkpoint=outputs/07_kl_guided/best.pt
+
+defaults:
+  - override /data: mqar
+  - override /model: hybrid_small
+  - override /training: experiment_fast
+
+experiment_name: kl_guided_selection
+
+project:
+  name: kl-guided-selection
+  output_dir: outputs/07_kl_guided
+
+model:
+  vocab_size: 8192
+  d_model: 256
+  encoder_layers: 2
+  decoder_layers: 8
+  d_state: 64
+  n_heads: 8
+  # Start with many positions, refine via KL
+  hybrid_positions: [0, 1, 2, 3, 4, 5, 6, 7]
+
+training:
+  kl_calibration_samples: 10000
+  kl_temperature: 2.0
+
+data:
+  num_pairs: 128
+  num_queries: 16

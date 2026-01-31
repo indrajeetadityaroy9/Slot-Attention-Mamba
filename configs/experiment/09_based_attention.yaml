@@ -1,0 +1,44 @@
+# @package _global_
+#
+# BASED Attention Experiment
+#
+# PURPOSE: Test Taylor linear + sliding window attention
+# - Linear branch: O(n) global context via Taylor feature map
+# - Window branch: O(w*n) local context via sliding window
+#
+# Reference: arXiv:2402.18668 (Stanford 2024)
+# "Simple Linear Attention Language Models Balance the Recall-Throughput Tradeoff"
+#
+# USAGE:
+#   python -m align_mamba.train experiment=09_based_attention model.based_feature_dim=null
+#   python -m align_mamba.train experiment=09_based_attention model.based_feature_dim=16
+#
+#   # Test different window sizes
+#   python -m align_mamba.train -m experiment=09_based_attention \
+#       model.based_window_size=32,64,128
+
+defaults:
+  - override /data: mqar
+  - override /model: hybrid_small
+  - override /training: experiment_fast
+
+experiment_name: based_attention_ablation
+
+project:
+  name: based-attention-ablation
+  output_dir: outputs/09_based_attention
+
+model:
+  vocab_size: 8192
+  d_model: 256
+  encoder_layers: 2
+  decoder_layers: 4
+  d_state: 64
+  n_heads: 8
+  hybrid_positions: [0]
+  based_feature_dim: 16
+  based_window_size: 64
+
+data:
+  num_pairs: 64
+  num_queries: 16

@@ -1,0 +1,43 @@
+# @package _global_
+#
+# HGRN2 State Expansion Experiment
+#
+# PURPOSE: Test d->d^2 state capacity via outer product
+# - Standard: d_state dimensions of capacity
+# - Expanded: d_state^2 effective capacity
+#
+# Reference: arXiv:2404.07904 (COLM 2024)
+# "Linear Attention with Forget Gates for Language Modeling"
+#
+# USAGE:
+#   python -m align_mamba.train experiment=08_state_expansion model.expansion_head_dim=null
+#   python -m align_mamba.train experiment=08_state_expansion model.expansion_head_dim=64
+#
+#   # Test on high capacity scenarios
+#   python -m align_mamba.train -m experiment=08_state_expansion \
+#       model.expansion_head_dim=null,64,128 data.num_pairs=128,256,512
+
+defaults:
+  - override /data: mqar
+  - override /model: hybrid_small
+  - override /training: experiment_fast
+
+experiment_name: state_expansion_ablation
+
+project:
+  name: state-expansion-ablation
+  output_dir: outputs/08_state_expansion
+
+model:
+  vocab_size: 8192
+  d_model: 256
+  encoder_layers: 2
+  decoder_layers: 4
+  d_state: 64
+  n_heads: 4
+  hybrid_positions: [0]
+  expansion_head_dim: 64
+
+data:
+  num_pairs: 256
+  num_queries: 16

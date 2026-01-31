@@ -1,0 +1,56 @@
+# @package _global_
+#
+# Full SOTA Ablation Sweep
+#
+# PURPOSE: Comprehensive ablation of all SOTA features
+# - Baseline: Standard Mamba + cross-attention
+# - +Polarization: A=0/A=1 channels
+# - +StateExpansion: d->d^2 capacity
+# - +SharedAttention: Zamba-style GSA
+# - +MemMamba: Cross-layer memory
+# - Full: All features combined
+#
+# USAGE:
+#   # Run full sweep (many configurations)
+#   python -m align_mamba.train -m experiment=11_full_ablation \
+#       project.seed=42,1337,2024 \
+#       model.polarized_channels=0,2 \
+#       model.expansion_head_dim=null,64 \
+#       model.concat_initial_residual=false,true \
+#       model.memory_pool_size=0,50
+
+defaults:
+  - override /data: mqar
+  - override /model: hybrid_small
+  - override /training: experiment_fast
+
+experiment_name: full_sota_ablation
+
+project:
+  name: full-sota-ablation
+  output_dir: outputs/11_full_ablation
+
+model:
+  vocab_size: 8192
+  d_model: 256
+  encoder_layers: 2
+  decoder_layers: 8
+  d_state: 64
+  n_heads: 8
+  hybrid_positions: [0, 2, 4, 6]
+
+  # SOTA features (all enabled by default)
+  polarized_channels: 2
+  expansion_head_dim: 64
+  concat_initial_residual: true
+  memory_pool_size: 50
+  memory_summary_dim: 64
+  cross_layer_frequency: 2
+
+data:
+  num_pairs: 128
+  num_queries: 16
+
+training:
+  # Extended training for comprehensive evaluation
+  max_steps: 50000

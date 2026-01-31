@@ -1,0 +1,45 @@
+# @package _global_
+#
+# MemMamba Long-Range Memory Experiment
+#
+# PURPOSE: Test cross-layer memory pool for long sequences
+# - Standard: Exponential decay loses distant information
+# - MemMamba: Priority-based memory pool preserves salient tokens
+#
+# Reference: arXiv:2510.03279
+# "Memory-Augmented Mamba for Ultra-Long Sequences"
+#
+# USAGE:
+#   python -m align_mamba.train experiment=10_memmamba model.memory_pool_size=0
+#   python -m align_mamba.train experiment=10_memmamba model.memory_pool_size=50
+#
+#   # Test on very long sequences
+#   python -m align_mamba.train -m experiment=10_memmamba \
+#       model.memory_pool_size=0,25,50,100 data.num_pairs=256,512
+
+defaults:
+  - override /data: mqar
+  - override /model: hybrid_small
+  - override /training: experiment_fast
+
+experiment_name: memmamba_ablation
+
+project:
+  name: memmamba-ablation
+  output_dir: outputs/10_memmamba
+
+model:
+  vocab_size: 8192
+  d_model: 256
+  encoder_layers: 2
+  decoder_layers: 8
+  d_state: 64
+  n_heads: 8
+  hybrid_positions: [0]
+  memory_pool_size: 50
+  memory_summary_dim: 64
+  cross_layer_frequency: 2
+
+data:
+  num_pairs: 256
+  num_queries: 16
