@@ -1,27 +1,14 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "align-mamba"
 version = "0.1.0"
-description = "State Capacity Limits in Selective SSMs"
-requires-python = ">=3.10"
-
 dependencies = [
-    "torch>=2.3.0",
+    "torch>=2.3",
     "numpy<2",
-    "pyyaml>=6.0",
-    "mamba-ssm>=2.0",
-    "causal-conv1d>=1.2",
+    "mamba-ssm>=2",
     "flash-attn>=2.5",
-    "triton>=2.1.0",
+    "triton>=2.1",
 ]
-
-[project.scripts]
-align-mamba = "align_mamba.train:main"
-align-eval = "align_mamba.evaluate:main"
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["align_mamba*"]
