@@ -1,0 +1,28 @@
+# Capacity cliff analysis across num_pairs range
+# Eval: align-eval --config configs/capacity_cliff.yaml
+
+run:
+  seed: 42
+  output_dir: outputs
+
+model:
+  d_model: 256
+  encoder_layers: 6
+  decoder_layers: 6
+  d_state: 64
+  n_heads: 4
+  cross_attn_layers: [0, 2]
+  mem_pool_size: 50
+  mem_summary_dim: 64
+  mem_update_freq: 4
+  dropout: 0.1
+
+data:
+  num_pairs: 128
+  num_queries: 16
+
+eval:
+  checkpoint: outputs/best
+  mode: capacity_cliff
+  num_samples: 500
+  batch_size: 32

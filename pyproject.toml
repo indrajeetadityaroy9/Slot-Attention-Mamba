@@ -11,4 +11,8 @@ dependencies = [
     "mamba-ssm>=2",
     "flash-attn>=2.5",
     "triton>=2.1",
+    "pyyaml>=6.0",
 ]
+
+[project.scripts]
+align-eval = "align_mamba.evaluate:main"

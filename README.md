@@ -82,13 +82,13 @@ All fixed thresholds and heuristics are replaced with learned mechanisms:
 pip install -e .
 
 # Train (distributed)
-torchrun --nproc_per_node=N -m align_mamba.train
+torchrun --nproc_per_node=N -m align_mamba.train --config configs/main.yaml
 
 # Evaluate
-align-eval outputs/best
+align-eval --config configs/main.yaml
 
 # Capacity cliff analysis
-align-eval outputs/best --capacity_cliff
+align-eval --config configs/capacity_cliff.yaml
 ```
 
 ### Python API
@@ -97,7 +97,7 @@ align-eval outputs/best --capacity_cliff
 from align_mamba import Config, HybridMambaEncoderDecoder
 
 config = Config()  # SOTA defaults
-model = HybridMambaEncoderDecoder.from_config(config, "cuda", torch.bfloat16)
+model = HybridMambaEncoderDecoder(config, device="cuda", dtype=torch.bfloat16)
 
 # Forward pass
 logits = model(src_ids, tgt_ids[:, :-1])

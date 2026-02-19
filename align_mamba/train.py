@@ -14,17 +14,14 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
-from align_mamba.config import Config
+from align_mamba.config import Config, load_yaml
 from align_mamba.data import create_dataloaders
 from align_mamba.model import HybridMambaEncoderDecoder, get_unwrapped_model
 from align_mamba.kernels.loss import fused_cross_entropy_loss
 
-torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 
 def setup_distributed():
@@ -133,8 +130,7 @@ class Trainer:
             loss.backward()
             loss_accum += loss.detach()
 
-            if self.config.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
 
             self.optimizer.step()
             self.scheduler.step()
@@ -216,7 +212,12 @@ class Trainer:
 
 
 def main():
-    config = Config()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True, help="Path to experiment YAML")
+    args = parser.parse_args()
+
+    config, _ = load_yaml(args.config)
     dist_info = setup_distributed()
 
     model = HybridMambaEncoderDecoder(config, device=str(dist_info["device"]), dtype=torch.bfloat16)

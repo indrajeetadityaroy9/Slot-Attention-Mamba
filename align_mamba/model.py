@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from mamba_ssm import Mamba2
 from flash_attn import flash_attn_func
 
-from align_mamba.config import Config, MAX_SEQ_LEN, VOCAB_SIZE
+from align_mamba.config import Config, MAX_SEQ_LEN
 from align_mamba.kernels.rmsnorm import fused_rmsnorm
 
 
@@ -175,7 +175,6 @@ class PolarizedMemBlock(nn.Module):
         self.layer_idx = layer_idx
         self.update_freq = update_freq
         self.pool_size = pool_size
-        self.summary_dim = summary_dim
 
         d_inner = d_model * 2
         self.norm = RMSNorm(d_model, device=device, dtype=dtype)
@@ -188,8 +187,6 @@ class PolarizedMemBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, pool: torch.Tensor,
                 priorities: torch.Tensor, counts: torch.Tensor):
-        B = x.size(0)
-
         h = self.norm(x).contiguous()
         y = x + self.fusion(torch.cat([
             self.mamba(h),
@@ -197,8 +194,8 @@ class PolarizedMemBlock(nn.Module):
             torch.cumsum(self.one_proj(h), dim=1)
         ], dim=-1))
 
-        scores = self.memory.score(y)
         if self.layer_idx % self.update_freq == 0:
+            scores = self.memory.score(y)
             pool, priorities, counts = self.memory.update(y, scores, pool, priorities, counts)
 
         pool_mask = torch.arange(self.pool_size, device=x.device).unsqueeze(0) < counts.unsqueeze(1)
@@ -338,13 +335,13 @@ class Decoder(nn.Module):
 class HybridMambaEncoderDecoder(nn.Module):
     def __init__(
         self,
-        config: Optional[Config] = None,
+        config: Config,
         *,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
         super().__init__()
-        self.config = config or Config()
+        self.config = config
 
         self.encoder = Encoder(
             self.config.vocab_size, self.config.d_model, self.config.encoder_layers,
@@ -362,26 +359,21 @@ class HybridMambaEncoderDecoder(nn.Module):
     def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
         return self.decoder(tgt, self.encoder(src))
 
-    @classmethod
-    def from_config(cls, config: Config, *, device: str, dtype: torch.dtype) -> "HybridMambaEncoderDecoder":
-        return cls(config, device=device, dtype=dtype)
-
 
 def get_unwrapped_model(model: nn.Module) -> nn.Module:
-    if hasattr(model, "_orig_mod"):
-        return model._orig_mod.module if hasattr(model._orig_mod, "module") else model._orig_mod
+    """Unwrap DDP to get the compiled model (which delegates to original)."""
     return model.module if hasattr(model, "module") else model
 
 
 def load_checkpoint(
     path: str,
+    config: Config,
     *,
     device: str,
     dtype: torch.dtype,
-) -> Tuple["HybridMambaEncoderDecoder", Config]:
-    ckpt = torch.load(f"{path}/checkpoint.pt", map_location='cpu', weights_only=False)
-    config = Config.from_dict(ckpt['config'])
+) -> "HybridMambaEncoderDecoder":
     model = HybridMambaEncoderDecoder(config, device=device, dtype=dtype)
-    model.load_state_dict(ckpt['model_state_dict'], strict=False)
+    ckpt = torch.load(f"{path}/checkpoint.pt", map_location='cpu', weights_only=True)
+    model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
-    return model, config
+    return model

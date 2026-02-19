@@ -1,15 +1,14 @@
 """Evaluation for Align-Mamba."""
 
-import argparse
 import json
+import shutil
 from pathlib import Path
-from typing import Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from align_mamba.config import Config
+from align_mamba.config import Config, load_yaml
 from align_mamba.model import load_checkpoint
 from align_mamba.data import MQARDataset
 
@@ -100,37 +99,40 @@ def capacity_cliff(
     return {"results": results, "cliff_point": cliff, "d_state": d_state}
 
 
-EvalMode = Literal["standard", "capacity_cliff"]
-
-
 def main():
+    import argparse
     parser = argparse.ArgumentParser(prog="align-eval")
-    parser.add_argument("checkpoint", help="Path to checkpoint directory")
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["standard", "capacity_cliff"],
-        default="standard",
-        help="Evaluation mode: 'standard' or 'capacity_cliff'",
-    )
+    parser.add_argument("--config", required=True, help="Path to experiment YAML")
     args = parser.parse_args()
 
-    model, config = load_checkpoint(args.checkpoint, device="cuda", dtype=torch.bfloat16)
+    config, eval_cfg = load_yaml(args.config)
+    model = load_checkpoint(
+        eval_cfg["checkpoint"], config, device="cuda", dtype=torch.bfloat16,
+    )
 
     out = Path(config.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    if args.mode == "capacity_cliff":
+    if eval_cfg["mode"] == "capacity_cliff":
         print(f"\nCapacity cliff eval (d_state={config.d_state})")
-        results = capacity_cliff(model, config)
-        with open(out / "capacity_cliff.json", "w") as f:
-            json.dump(results, f, indent=2)
+        results = capacity_cliff(
+            model, config,
+            num_samples=eval_cfg.get("num_samples", 500),
+            batch_size=eval_cfg.get("batch_size", 32),
+        )
         print(f"Cliff at pairs={results['cliff_point']}")
     else:
-        results = evaluate(model, config)
+        results = evaluate(
+            model, config,
+            num_samples=eval_cfg.get("num_samples", 1000),
+            batch_size=eval_cfg.get("batch_size", 32),
+        )
         print(f"acc={results['token_accuracy']:.4f} ppl={results['perplexity']:.2f}")
-        with open(out / "results.json", "w") as f:
-            json.dump(results, f, indent=2)
+
+    with open(out / "metrics.json", "w") as f:
+        json.dump(results, f, indent=2)
+    shutil.copy2(args.config, out / "config.yaml")
+    print(f"Results written to {out / 'metrics.json'}")
 
 
 if __name__ == "__main__":

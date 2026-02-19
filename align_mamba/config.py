@@ -61,19 +61,20 @@ class Config:
     def warmup_steps(self) -> int:
         return int(self.warmup_ratio * self.max_steps)
 
-    @classmethod
-    def from_dict(cls, data: dict) -> "Config":
-        """Reconstruct from checkpoint dict."""
-        valid = {f.name for f in fields(cls)}
-        filtered = {k: v for k, v in data.items() if k in valid}
-        if 'cross_attn_layers' in filtered and isinstance(filtered['cross_attn_layers'], list):
-            filtered['cross_attn_layers'] = tuple(filtered['cross_attn_layers'])
-        if 'hybrid_positions' in data:
-            filtered['cross_attn_layers'] = tuple(data['hybrid_positions'])
-        return cls(**filtered)
-
     def to_dict(self) -> dict:
-        d = asdict(self)
-        d['vocab_size'] = self.vocab_size
-        d['warmup_steps'] = self.warmup_steps
-        return d
+        return asdict(self)
+
+
+def load_yaml(path: str):
+    """Load experiment config from YAML. Returns (Config, eval_section or None)."""
+    import yaml
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+    flat = {}
+    for section in ('run', 'model', 'data', 'training'):
+        if section in raw:
+            flat.update(raw[section])
+    if 'cross_attn_layers' in flat and isinstance(flat['cross_attn_layers'], list):
+        flat['cross_attn_layers'] = tuple(flat['cross_attn_layers'])
+    valid = {f.name for f in fields(Config)}
+    return Config(**{k: v for k, v in flat.items() if k in valid}), raw.get('eval')

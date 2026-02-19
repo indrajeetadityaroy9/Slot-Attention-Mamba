@@ -13,8 +13,6 @@ from align_mamba.config import (
     KEY_TOKEN_START, KEY_TOKEN_END, VALUE_TOKEN_START, VALUE_TOKEN_END,
 )
 
-# Fixed constants
-_MIN_SEQ_LEN = 512
 _NUM_WORKERS = 8
 
 
@@ -29,7 +27,6 @@ class MQARDataset(Dataset):
     def __init__(self, num_pairs: int, num_queries: int, num_samples: int, split: Split):
         self.num_pairs = num_pairs
         self.num_queries = min(num_queries, num_pairs)
-        self.seq_len = max(_MIN_SEQ_LEN, int((1 + num_pairs * 3 + 1 + self.num_queries + 1) * 1.1))
 
         self._rng = random.Random(self.SPLIT_SEEDS[split])
         self._samples = [self._gen() for _ in range(num_samples)]
