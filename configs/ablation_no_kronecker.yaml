@@ -1,0 +1,5 @@
+base: main.yaml
+
+model:
+  kronecker_partitions: 1
+  kronecker_subdim: 1024

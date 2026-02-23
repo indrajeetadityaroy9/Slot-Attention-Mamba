@@ -1,0 +1,4 @@
+base: main.yaml
+
+model:
+  use_surprise_gate: false

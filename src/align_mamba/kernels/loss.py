@@ -1,5 +1,3 @@
-#Fused cross-entropy with label smoothing
-
 import torch
 import triton
 import triton.language as tl
@@ -28,8 +26,11 @@ def _ce_kernel(LOGITS, LABELS, LOSSES, stride, V, smoothing, ignore_idx, BLOCK: 
         logits = tl.load(ptr + cols, mask=mask, other=float("-inf")).to(tl.float32)
 
         is_target = (cols == label) & mask
-        target_logit = tl.where(tl.max(is_target.to(tl.int32), axis=0) > 0,
-                                tl.sum(tl.where(is_target, logits, 0.0), axis=0), target_logit)
+        target_logit = tl.where(
+            tl.max(is_target, axis=0) > 0,
+            tl.sum(tl.where(is_target, logits, 0.0), axis=0),
+            target_logit,
+        )
 
         logit_sum += tl.sum(tl.where(mask, logits, 0.0), axis=0)
 
@@ -50,10 +51,9 @@ def fused_cross_entropy_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     *,
-    smoothing: float = 0.1,
-    ignore_index: int = -100,
+    smoothing: float,
+    ignore_index: int,
 ) -> torch.Tensor:
-    # Cross-entropy with label smoothing, mean-reduced over valid tokens.
     B, T, V = logits.shape
     logits = logits.view(B * T, V).contiguous()
     labels = labels.view(B * T).contiguous()

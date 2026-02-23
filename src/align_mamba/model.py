@@ -1,4 +1,3 @@
-# SlotMamba model.
 import math
 
 import torch
@@ -7,34 +6,48 @@ import torch.nn.functional as F
 from mamba_ssm import Mamba2
 from flash_attn import flash_attn_func
 
-from align_mamba.config import Config, MAX_SEQ_LEN, PAD_TOKEN_ID, VOCAB_SIZE
+from align_mamba.config import Config, PAD_TOKEN_ID
 from align_mamba.kernels.rmsnorm import fused_rmsnorm
-
-_MAMBA_D_CONV = 4
-_MAMBA_EXPAND = 2
-_MAMBA_HEADDIM = 64
 
 _ROPE_BASE = 10000.0
 _RMSNORM_EPS = 1e-5
+_HOUSEHOLDER_BETA_MAX = 2.0  # Keep reflector amplitude bounded.
+_DECAY_GAMMA_INIT = 1.0
 
-_ETA_CLAMP = (0.5, 0.999)
+
+def _retention_bias(top_k: int) -> float:
+    #Set sigmoid(bias) to the default retention (K-1)/K.
+    return math.log(max(top_k - 1, 1))
+
+
+def encoder_attn_positions(n_layers: int) -> frozenset[int]:
+    return frozenset(range(n_layers // 2, n_layers, 2))
+
+
+def decoder_inject_positions(n_layers: int) -> frozenset[int]:
+    return frozenset(range(0, n_layers // 2, 2))
+
+
+def decoder_attn_position(n_layers: int) -> int:
+    return n_layers - 2
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, d_model: int, *, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def __init__(self, d_model: int, *, dtype: torch.dtype | None = None):
         super().__init__()
         self.eps = _RMSNORM_EPS
-        self.weight = nn.Parameter(torch.ones(d_model, device=device, dtype=dtype))
+        self.weight = nn.Parameter(torch.ones(d_model, device="cuda", dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return fused_rmsnorm(x, self.weight, self.eps)
 
 
 class Embedding(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int, dropout: float, *, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def __init__(self, vocab_size: int, d_model: int, dropout: float, *,
+                 padding_idx: int | None = PAD_TOKEN_ID, dtype: torch.dtype | None = None):
         super().__init__()
-        self.embed = nn.Embedding(vocab_size, d_model, padding_idx=PAD_TOKEN_ID, device=device)
-        self.scale = nn.Parameter(torch.tensor(math.sqrt(d_model), device=device, dtype=dtype))
+        self.embed = nn.Embedding(vocab_size, d_model, padding_idx=padding_idx, device="cuda")
+        self.scale = nn.Parameter(torch.tensor(math.sqrt(d_model), device="cuda", dtype=dtype))
         self.dropout = nn.Dropout(dropout)
         self.dtype = dtype
 
@@ -43,10 +56,10 @@ class Embedding(nn.Module):
 
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, *, device: torch.device | None = None):
+    def __init__(self, dim: int, max_seq_len: int):
         super().__init__()
-        inv_freq = 1.0 / (_ROPE_BASE ** (torch.arange(0, dim, 2, device=device).float() / dim))
-        t = torch.arange(MAX_SEQ_LEN, device=device, dtype=inv_freq.dtype)
+        inv_freq = 1.0 / (_ROPE_BASE ** (torch.arange(0, dim, 2, device="cuda").float() / dim))
+        t = torch.arange(max_seq_len, device="cuda", dtype=inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         emb = torch.cat([freqs, freqs], dim=-1)
         self.register_buffer("cos", emb.cos())
@@ -63,15 +76,16 @@ class RotaryEmbedding(nn.Module):
 
 
 class BiMambaBlock(nn.Module):
-    def __init__(self, config: Config, *, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def __init__(self, config: Config, *, dtype: torch.dtype | None = None):
         super().__init__()
         d = config.d_model
-        self.norm = RMSNorm(d, device=device, dtype=dtype)
-        self.fwd = Mamba2(d_model=d, d_state=config.d_state, d_conv=_MAMBA_D_CONV,
-                         expand=_MAMBA_EXPAND, headdim=_MAMBA_HEADDIM, device=device, dtype=dtype)
-        self.bwd = Mamba2(d_model=d, d_state=config.d_state, d_conv=_MAMBA_D_CONV,
-                         expand=_MAMBA_EXPAND, headdim=_MAMBA_HEADDIM, device=device, dtype=dtype)
-        self.out_proj = nn.Linear(d * 2, d, bias=False, device=device, dtype=dtype)
+        self.norm = RMSNorm(d, dtype=dtype)
+        headdim = d // config.n_heads
+        self.fwd = Mamba2(d_model=d, d_state=config.d_state, d_conv=config.mamba_d_conv,
+                         expand=config.mamba_expand, headdim=headdim, device="cuda", dtype=dtype)
+        self.bwd = Mamba2(d_model=d, d_state=config.d_state, d_conv=config.mamba_d_conv,
+                         expand=config.mamba_expand, headdim=headdim, device="cuda", dtype=dtype)
+        self.out_proj = nn.Linear(d * 2, d, bias=False, device="cuda", dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.norm(x).contiguous()
@@ -81,8 +95,7 @@ class BiMambaBlock(nn.Module):
 
 
 class Attention(nn.Module):
-    # FlashAttention with RoPE. Used bidirectionally in encoder, causally in decoder.
-    def __init__(self, config: Config, *, causal: bool = False, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def __init__(self, config: Config, *, causal: bool = False, dtype: torch.dtype | None = None):
         super().__init__()
         d = config.d_model
         self.n_heads = config.n_heads
@@ -90,10 +103,19 @@ class Attention(nn.Module):
         self.dropout = config.dropout
         self.causal = causal
 
-        self.norm = RMSNorm(d, device=device, dtype=dtype)
-        self.qkv = nn.Linear(d, d * 3, bias=False, device=device, dtype=dtype)
-        self.out = nn.Linear(d, d, bias=False, device=device, dtype=dtype)
-        self.rope = RotaryEmbedding(self.head_dim, device=device)
+        self.norm = RMSNorm(d, dtype=dtype)
+        self.qkv = nn.Linear(d, d * 3, bias=False, device="cuda", dtype=dtype)
+        self.out = nn.Linear(d, d, bias=False, device="cuda", dtype=dtype)
+        # RoPE cache must cover both train and eval sequence lengths.
+        n_registers = 2 * config.n_heads
+        if config.task == "lm":
+            max_seq_len = (config.lm_seq_length - 1) + n_registers
+        else:
+            effective_pairs = max(config.num_pairs, config.eval_max_num_pairs)
+            src_len = 3 * effective_pairs + 2
+            tgt_len = effective_pairs + 2 + n_registers
+            max_seq_len = max(src_len, tgt_len)
+        self.rope = RotaryEmbedding(self.head_dim, max_seq_len)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -106,23 +128,8 @@ class Attention(nn.Module):
         return residual + self.out(out.view(B, T, -1))
 
 
-class PersistentMemory(nn.Module):
-    def __init__(self, config: Config, *, device: torch.device | None = None, dtype: torch.dtype | None = None):
-        super().__init__()
-        d = config.d_model
-        self.n_registers = config.n_persistent_mem
-        self.registers = nn.Parameter(torch.randn(1, self.n_registers, d, device=device, dtype=dtype) * (d ** -0.5))
-
-    def prepend(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.cat([self.registers.expand(x.size(0), -1, -1), x], dim=1)
-
-    def strip(self, x: torch.Tensor) -> torch.Tensor:
-        return x[:, self.n_registers:]
-
-
 class BlockDiagonalLRU(nn.Module):
-    # Block-diagonal linear recurrence with dense m x m transitions.
-    def __init__(self, config: Config, *, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def __init__(self, config: Config, *, dtype: torch.dtype | None = None):
         super().__init__()
         d = config.d_model
         m = config.block_size
@@ -130,10 +137,10 @@ class BlockDiagonalLRU(nn.Module):
         self.m = m
         self.H = H
 
-        self.norm = RMSNorm(d, device=device, dtype=dtype)
-        self.W_v = nn.Linear(d, d, bias=False, device=device, dtype=dtype)
-        self.W_a = nn.Linear(d, H * m * (m + 1), bias=False, device=device, dtype=dtype)
-        self.out_proj = nn.Linear(d, d, bias=False, device=device, dtype=dtype)
+        self.norm = RMSNorm(d, dtype=dtype)
+        self.W_v = nn.Linear(d, d, bias=False, device="cuda", dtype=dtype)
+        self.W_a = nn.Linear(d, H * m * (m + 1), bias=False, device="cuda", dtype=dtype)
+        self.out_proj = nn.Linear(d, d, bias=False, device="cuda", dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
@@ -144,7 +151,7 @@ class BlockDiagonalLRU(nn.Module):
         gate_logits = self.W_a(h).view(B, T, H, m, m + 1)
         gates = F.softmax(gate_logits, dim=-1)
 
-        # gate[..., 0] is input injection; gate[..., 1:] is recurrent transition.
+        # Split gate between input injection and recurrent transition.
         a0 = gates[..., 0]
         A = gates[..., 1:]
 
@@ -159,54 +166,52 @@ class BlockDiagonalLRU(nn.Module):
 
 
 class KroneckerAddress(nn.Module):
-    # Top-k slot addresses from a Kronecker-factored distribution.
     def __init__(self, config: Config):
         super().__init__()
         self.U = config.kronecker_partitions
         self.d_p = config.kronecker_subdim
         self.K = config.top_k_slots
-        self.log_tau = nn.Parameter(torch.zeros(1))
+        self.log_tau = nn.Parameter(torch.zeros(1, device="cuda"))
 
     def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B = z.size(0)
         parts = z.view(B, self.U, self.d_p)
-        tau = self.log_tau.exp().clamp(min=0.1, max=10.0)
+        tau = self.log_tau.exp()
         probs = F.softmax(parts / tau, dim=-1)
 
         addr = probs[:, 0]
         for u in range(1, self.U):
             addr = (addr.unsqueeze(-1) * probs[:, u].unsqueeze(-2)).reshape(B, -1)
 
-        # PDMA normalization is tracked in z_K/z_V, so top-k weights stay unnormalized here.
+        # Keep raw top-k weights; normalization is tracked separately in z_K/z_V.
         weights, indices = addr.topk(self.K, dim=-1)
         return indices, weights
 
 
 class HKSU(nn.Module):
-    # Householder writes with PDMA decay and sparse readout.
-    def __init__(self, config: Config, *, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def __init__(self, config: Config, *, dtype: torch.dtype | None = None):
         super().__init__()
         d = config.d_model
         d_k = config.kronecker_partitions * config.kronecker_subdim
         n_h = config.n_householder_steps
         self.M = config.kronecker_subdim ** config.kronecker_partitions
         self.n_h = n_h
+        self.use_pdma = config.use_pdma
         self.scale = d ** -0.5
 
-        self.W_k = nn.Linear(d, d_k, bias=False, device=device, dtype=dtype)
-        self.W_q = nn.Linear(d, d_k, bias=False, device=device, dtype=dtype)
+        self.W_k = nn.Linear(d, d_k, bias=False, device="cuda", dtype=dtype)
+        self.W_q = nn.Linear(d, d_k, bias=False, device="cuda", dtype=dtype)
         self.write_addr = KroneckerAddress(config)
         self.read_addr = KroneckerAddress(config)
 
-        self.hh_k_projs = nn.ModuleList([nn.Linear(d, d, bias=False, device=device, dtype=dtype) for _ in range(n_h)])
-        self.hh_v_projs_k = nn.ModuleList([nn.Linear(d, d, bias=False, device=device, dtype=dtype) for _ in range(n_h)])
-        self.hh_v_projs_v = nn.ModuleList([nn.Linear(d, d, bias=False, device=device, dtype=dtype) for _ in range(n_h)])
-        self.hh_beta_projs = nn.ModuleList([nn.Linear(d, 1, bias=True, device=device, dtype=dtype) for _ in range(n_h)])
+        self.hh_k_projs = nn.ModuleList([nn.Linear(d, d, bias=False, device="cuda", dtype=dtype) for _ in range(n_h)])
+        self.hh_v_projs_k = nn.ModuleList([nn.Linear(d, d, bias=False, device="cuda", dtype=dtype) for _ in range(n_h)])
+        self.hh_v_projs_v = nn.ModuleList([nn.Linear(d, d, bias=False, device="cuda", dtype=dtype) for _ in range(n_h)])
+        self.hh_beta_projs = nn.ModuleList([nn.Linear(d, 1, bias=True, device="cuda", dtype=dtype) for _ in range(n_h)])
 
-        self.gamma = nn.Parameter(torch.tensor(config.decay_gamma_init, device=device, dtype=dtype))
-
-        self.W_out = nn.Linear(d, d, bias=False, device=device, dtype=dtype)
-        self.W_gate = nn.Linear(d, d, bias=False, device=device, dtype=dtype)
+        self.gamma = nn.Parameter(torch.tensor(_DECAY_GAMMA_INIT, device="cuda", dtype=dtype))
+        self.W_out = nn.Linear(d, d, bias=False, device="cuda", dtype=dtype)
+        self.W_gate = nn.Linear(d, d, bias=False, device="cuda", dtype=dtype)
 
     def forward(
         self,
@@ -217,7 +222,6 @@ class HKSU(nn.Module):
         z_V: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor, torch.Tensor]:
-        # Returns: (output, K_slots, V_slots, z_K, z_V, last_write_idx, last_read_idx).
         B, T, D = h.shape
         M, n_h = self.M, self.n_h
         outputs = []
@@ -230,11 +234,15 @@ class HKSU(nn.Module):
 
             w_full = torch.zeros(B, M, device=h.device, dtype=h.dtype)
             w_full.scatter_(1, write_idx, write_w)
-            decay = (1.0 - w_full) ** self.gamma
-            K_slots = decay.unsqueeze(-1) * K_slots
-            V_slots = decay.unsqueeze(-1) * V_slots
-            z_K = decay * z_K + w_full
-            z_V = decay * z_V + w_full
+            if self.use_pdma:
+                decay = (1.0 - w_full) ** self.gamma
+                K_slots = decay.unsqueeze(-1) * K_slots
+                V_slots = decay.unsqueeze(-1) * V_slots
+                z_K = decay * z_K + w_full
+                z_V = decay * z_V + w_full
+            else:
+                z_K = z_K + w_full
+                z_V = z_V + w_full
 
             idx_exp = write_idx.unsqueeze(-1).expand(-1, -1, D)
             K_active = torch.gather(K_slots, 1, idx_exp)
@@ -245,7 +253,7 @@ class HKSU(nn.Module):
                 k_hat = F.normalize(k_j, dim=-1)
                 v_kj = self.hh_v_projs_k[j](h_t)
                 v_vj = self.hh_v_projs_v[j](h_t)
-                beta_j = 2.0 * torch.sigmoid(self.hh_beta_projs[j](h_t))
+                beta_j = _HOUSEHOLDER_BETA_MAX * torch.sigmoid(self.hh_beta_projs[j](h_t))
 
                 k_hat_e = k_hat.unsqueeze(1)
                 beta_e = beta_j.unsqueeze(1)
@@ -263,8 +271,8 @@ class HKSU(nn.Module):
             K_read = torch.gather(K_slots, 1, read_exp)
             V_read = torch.gather(V_slots, 1, read_exp)
 
-            z_K_read = torch.gather(z_K, 1, read_idx).unsqueeze(-1).clamp(min=1e-8)
-            z_V_read = torch.gather(z_V, 1, read_idx).unsqueeze(-1).clamp(min=1e-8)
+            z_K_read = torch.gather(z_K, 1, read_idx).unsqueeze(-1)
+            z_V_read = torch.gather(z_V, 1, read_idx).unsqueeze(-1)
             K_normed = K_read / z_K_read
             V_normed = V_read / z_V_read
 
@@ -279,18 +287,21 @@ class HKSU(nn.Module):
 
 
 class SurpriseGate(nn.Module):
-    def __init__(self, config: Config, *, n_gate_slots: int, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def __init__(self, config: Config, *, n_gate_slots: int, dtype: torch.dtype | None = None):
         super().__init__()
         d = config.d_model
         self.scale = d ** -0.5
-        self.k_gate_proj = nn.Linear(2, n_gate_slots, bias=True, device=device, dtype=dtype)
-        self.v_gate_proj = nn.Linear(2, n_gate_slots, bias=True, device=device, dtype=dtype)
-        # Positive bias favors retaining previous slot state at initialization.
-        nn.init.constant_(self.k_gate_proj.bias, 1.0)
-        nn.init.constant_(self.v_gate_proj.bias, 1.0)
+        self.k_gate_proj = nn.Linear(2, n_gate_slots, bias=True, device="cuda", dtype=dtype)
+        self.v_gate_proj = nn.Linear(2, n_gate_slots, bias=True, device="cuda", dtype=dtype)
+        retention_bias = _retention_bias(config.top_k_slots)
+        nn.init.constant_(self.k_gate_proj.bias, retention_bias)
+        nn.init.constant_(self.v_gate_proj.bias, retention_bias)
+        # Initialize EMA to roughly a sequence-length window.
+        seq_len = config.lm_seq_length if config.task == "lm" else config.num_queries + 2
+        eta_init = 1.0 - 1.0 / seq_len
         self.logit_eta = nn.Parameter(torch.tensor(
-            math.log(config.surprise_eta_init / (1.0 - config.surprise_eta_init)), device=device, dtype=dtype))
-        self.surprise_logit_alpha = nn.Parameter(torch.zeros(1, device=device, dtype=dtype))
+            math.log(eta_init / (1.0 - eta_init)), device="cuda", dtype=dtype))
+        self.surprise_logit_alpha = nn.Parameter(torch.zeros(1, device="cuda", dtype=dtype))
 
     def forward(
         self,
@@ -299,7 +310,6 @@ class SurpriseGate(nn.Module):
         h: torch.Tensor, momentum: torch.Tensor,
         active_idx: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Apply surprise-based gating on active read slots only.
         D = K_curr.size(-1)
         idx_exp = active_idx.unsqueeze(-1).expand(-1, -1, D)
 
@@ -320,7 +330,7 @@ class SurpriseGate(nn.Module):
 
         alpha = torch.sigmoid(self.surprise_logit_alpha)
         combined_surprise = alpha * k_surprise + (1.0 - alpha) * v_surprise
-        eta = torch.sigmoid(self.logit_eta.float()).clamp(min=_ETA_CLAMP[0], max=_ETA_CLAMP[1])
+        eta = torch.sigmoid(self.logit_eta.float())
         new_momentum = eta * momentum + (1.0 - eta) * combined_surprise
 
         k_gate_input = torch.cat([k_surprise, new_momentum], dim=-1).to(self.k_gate_proj.weight.dtype)
@@ -337,15 +347,15 @@ class SurpriseGate(nn.Module):
 
 
 class DecoupledInjection(nn.Module):
-    def __init__(self, config: Config, *, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def __init__(self, config: Config, *, dtype: torch.dtype | None = None):
         super().__init__()
         d = config.d_model
         self.scale = d ** -0.5
-        self.W_cross = nn.Linear(d, d, bias=False, device=device, dtype=dtype)
-        self.W_ek = nn.Linear(d, d, bias=False, device=device, dtype=dtype)
-        self.W_ev = nn.Linear(d, d, bias=False, device=device, dtype=dtype)
-        self.W_lambda_k = nn.Linear(d * 2, 1, bias=True, device=device, dtype=dtype)
-        self.W_lambda_v = nn.Linear(d * 2, 1, bias=True, device=device, dtype=dtype)
+        self.W_cross = nn.Linear(d, d, bias=False, device="cuda", dtype=dtype)
+        self.W_ek = nn.Linear(d, d, bias=False, device="cuda", dtype=dtype)
+        self.W_ev = nn.Linear(d, d, bias=False, device="cuda", dtype=dtype)
+        self.W_lambda_k = nn.Linear(d * 2, 1, bias=True, device="cuda", dtype=dtype)
+        self.W_lambda_v = nn.Linear(d * 2, 1, bias=True, device="cuda", dtype=dtype)
 
     def forward(
         self,
@@ -354,7 +364,6 @@ class DecoupledInjection(nn.Module):
         encoder_out: torch.Tensor,
         active_idx: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Inject encoder context into active write slots only.
         D = K_slots.size(-1)
         idx_exp = active_idx.unsqueeze(-1).expand(-1, -1, D)
 
@@ -378,7 +387,6 @@ class DecoupledInjection(nn.Module):
 
 
 class HKSABlock(nn.Module):
-    # Decoder layer with optional causal attention, injection, and surprise gate.
     def __init__(
         self,
         config: Config,
@@ -386,7 +394,6 @@ class HKSABlock(nn.Module):
         has_injection: bool,
         has_surprise_gate: bool,
         has_causal_attn: bool = False,
-        device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
         super().__init__()
@@ -396,17 +403,17 @@ class HKSABlock(nn.Module):
         K = config.top_k_slots
 
         if has_causal_attn:
-            self.causal_attn = Attention(config, causal=True, device=device, dtype=dtype)
+            self.causal_attn = Attention(config, causal=True, dtype=dtype)
 
-        self.bdlru = BlockDiagonalLRU(config, device=device, dtype=dtype)
-        self.hksu = HKSU(config, device=device, dtype=dtype)
+        self.bdlru = BlockDiagonalLRU(config, dtype=dtype)
+        self.hksu = HKSU(config, dtype=dtype)
         self.dropout = nn.Dropout(config.dropout)
 
         if has_injection:
-            self.injection = DecoupledInjection(config, device=device, dtype=dtype)
+            self.injection = DecoupledInjection(config, dtype=dtype)
 
         if has_surprise_gate:
-            self.surprise_gate = SurpriseGate(config, n_gate_slots=K, device=device, dtype=dtype)
+            self.surprise_gate = SurpriseGate(config, n_gate_slots=K, dtype=dtype)
 
     def forward(
         self,
@@ -418,7 +425,7 @@ class HKSABlock(nn.Module):
         K_prev: torch.Tensor,
         V_prev: torch.Tensor,
         momentum: torch.Tensor,
-        encoder_out: torch.Tensor,
+        encoder_out: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.has_causal_attn:
             x = self.causal_attn(x)
@@ -443,18 +450,19 @@ class HKSABlock(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, config: Config, *, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def __init__(self, config: Config, *, dtype: torch.dtype | None = None):
         super().__init__()
         d = config.d_model
         n_layers = config.encoder_layers
-        self.embed = Embedding(VOCAB_SIZE, d, config.dropout, device=device, dtype=dtype)
-        attn_pos = set(config.encoder_attn_layers)
+        pad = None if config.task == "lm" else PAD_TOKEN_ID
+        self.embed = Embedding(config.vocab_size, d, config.dropout, padding_idx=pad, dtype=dtype)
+        attn_pos = encoder_attn_positions(n_layers)
         self.layers = nn.ModuleList([
-            Attention(config, device=device, dtype=dtype) if i in attn_pos
-            else BiMambaBlock(config, device=device, dtype=dtype)
+            Attention(config, dtype=dtype) if i in attn_pos
+            else BiMambaBlock(config, dtype=dtype)
             for i in range(n_layers)
         ])
-        self.norm = RMSNorm(d, device=device, dtype=dtype)
+        self.norm = RMSNorm(d, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.embed(x)
@@ -464,36 +472,37 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    # HKSA decoder with slot state threaded across layers.
-    def __init__(self, config: Config, *, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def __init__(self, config: Config, *, dtype: torch.dtype | None = None):
         super().__init__()
         d = config.d_model
         n_layers = config.decoder_layers
-        attn_layer = config.decoder_attn_layer
-        inject_set = set(config.encoder_inject_layers)
+        attn_layer = decoder_attn_position(n_layers)
+        inject_set = decoder_inject_positions(n_layers)
 
         self.M = config.kronecker_subdim ** config.kronecker_partitions
         self.d_model = d
 
-        self.embed = Embedding(VOCAB_SIZE, d, config.dropout, device=device, dtype=dtype)
-        self.norm = RMSNorm(d, device=device, dtype=dtype)
-        self.head = nn.Linear(d, VOCAB_SIZE, bias=False, device=device, dtype=dtype)
-        self.persistent_mem = PersistentMemory(config, device=device, dtype=dtype)
+        pad = None if config.task == "lm" else PAD_TOKEN_ID
+        self.embed = Embedding(config.vocab_size, d, config.dropout, padding_idx=pad, dtype=dtype)
+        self.norm = RMSNorm(d, dtype=dtype)
+        self.head = nn.Linear(d, config.vocab_size, bias=False, device="cuda", dtype=dtype)
+        self.n_registers = 2 * config.n_heads
+        self.registers = nn.Parameter(torch.randn(1, self.n_registers, d, device="cuda", dtype=dtype) * (d ** -0.5))
 
         self.layers = nn.ModuleList()
         for i in range(n_layers):
             self.layers.append(HKSABlock(
                 config,
-                has_injection=(i in inject_set),
-                has_surprise_gate=(i > 0),
+                has_injection=(i in inject_set) and config.use_injection,
+                has_surprise_gate=(i > 0) and config.use_surprise_gate,
                 has_causal_attn=(i == attn_layer),
-                device=device, dtype=dtype,
+                dtype=dtype,
             ))
 
-    def forward(self, x: torch.Tensor, encoder_out: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, encoder_out: torch.Tensor | None) -> torch.Tensor:
         B = x.size(0)
         x = self.embed(x)
-        x = self.persistent_mem.prepend(x)
+        x = torch.cat([self.registers.expand(B, -1, -1), x], dim=1)
 
         K_slots = torch.zeros(B, self.M, self.d_model, device=x.device, dtype=x.dtype)
         V_slots = torch.zeros(B, self.M, self.d_model, device=x.device, dtype=x.dtype)
@@ -508,20 +517,23 @@ class Decoder(nn.Module):
                 x, K_slots, V_slots, z_K, z_V, K_prev, V_prev, momentum, encoder_out,
             )
 
-        x = self.persistent_mem.strip(x)
+        x = x[:, self.n_registers:]
         x = self.norm(x)
         return self.head(x)
 
 
 class HybridMambaEncoderDecoder(nn.Module):
-    def __init__(self, config: Config, *, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def __init__(self, config: Config, *, dtype: torch.dtype | None = None):
         super().__init__()
         self.config = config
-        self.encoder = Encoder(config, device=device, dtype=dtype)
-        self.decoder = Decoder(config, device=device, dtype=dtype)
+        self.has_encoder = config.encoder_layers > 0
+        if self.has_encoder:
+            self.encoder = Encoder(config, dtype=dtype)
+        self.decoder = Decoder(config, dtype=dtype)
 
-    def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
-        return self.decoder(tgt, self.encoder(src))
+    def forward(self, src: torch.Tensor | None, tgt: torch.Tensor) -> torch.Tensor:
+        encoder_out = self.encoder(src) if self.has_encoder else None
+        return self.decoder(tgt, encoder_out)
 
 
 def load_checkpoint(
@@ -529,10 +541,9 @@ def load_checkpoint(
     config: Config,
     *,
     dtype: torch.dtype,
-    device: str = "cuda",
-) -> "HybridMambaEncoderDecoder":
-    model = HybridMambaEncoderDecoder(config, device=device, dtype=dtype)
-    ckpt = torch.load(f"{path}/checkpoint.pt", map_location=device, weights_only=True)
+) -> HybridMambaEncoderDecoder:
+    model = HybridMambaEncoderDecoder(config, dtype=dtype)
+    ckpt = torch.load(f"{path}/checkpoint.pt", map_location="cuda", weights_only=True)
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
     return model

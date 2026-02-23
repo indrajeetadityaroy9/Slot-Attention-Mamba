@@ -1,4 +1,3 @@
-# Fused RMSNorm with d_model > 8192 support.
 import torch
 import triton
 import triton.language as tl
@@ -49,8 +48,7 @@ def _norm_chunk_kernel(X, W, Y, VAR, stride, N, eps, start, size, BLOCK: tl.cons
     tl.store(Y + row * stride + actual, y.to(x.dtype), mask=mask)
 
 
-def fused_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
-    # RMSNorm: y = x * rsqrt(mean(x^2) + eps) * weight.
+def fused_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     N = x.shape[-1]
     x_flat = x.contiguous().view(-1, N)
     rows = x_flat.shape[0]
@@ -58,8 +56,17 @@ def fused_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> t
 
     if N <= _RMSNORM_CHUNK:
         BLOCK = triton.next_power_of_2(N)
-        _rmsnorm_kernel[(rows,)](x_flat, y, weight, x_flat.stride(0), N, eps, BLOCK=min(BLOCK, _RMSNORM_CHUNK))
+        _rmsnorm_kernel[(rows,)](
+            x_flat,
+            y,
+            weight,
+            x_flat.stride(0),
+            N,
+            eps,
+            BLOCK=min(BLOCK, _RMSNORM_CHUNK),
+        )
     else:
+        # Chunked path keeps memory bounded for very wide hidden sizes.
         var = torch.zeros(rows, device=x.device, dtype=torch.float32)
         BLOCK = _RMSNORM_CHUNK
         for start in range(0, N, BLOCK):

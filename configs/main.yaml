@@ -1,24 +1,18 @@
-run:
-  seed: 42
-  output_dir: results
-
 model:
   d_model: 256
   encoder_layers: 6
   decoder_layers: 6
   d_state: 64
   n_heads: 4
-  encoder_inject_layers: [0, 2]
-  encoder_attn_layers: [3, 5]
-  n_persistent_mem: 8
+  vocab_size: 8192
   dropout: 0.1
   block_size: 4
   n_householder_steps: 2
   kronecker_partitions: 5
   kronecker_subdim: 4
   top_k_slots: 8
-  decay_gamma_init: 1.0
-  decoder_attn_layer: 4
+  mamba_expand: 2
+  mamba_d_conv: 4
 
 data:
   num_pairs: 128
@@ -29,16 +23,12 @@ data:
 training:
   batch_size: 256
   max_steps: 100000
-  learning_rate: 3.0e-4
-  weight_decay: 0.01
-  label_smoothing: 0.1
-  grad_clip: 1.0
+  seed: 42
+  output_dir: results
   resume_from: ""
 
-checkpoint:
-  path: results/best
-
 evaluation:
-  mode: standard
-  num_samples: 1000
-  batch_size: 32
+  eval_mode: standard
+  eval_num_samples: 1000
+  eval_batch_size: 32
+  eval_checkpoint: results/best

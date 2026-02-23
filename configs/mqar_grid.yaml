@@ -1,0 +1,5 @@
+base: main.yaml
+
+evaluation:
+  eval_mode: grid
+  eval_num_samples: 500

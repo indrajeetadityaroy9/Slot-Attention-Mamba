@@ -1,0 +1,14 @@
+base: wikitext103.yaml
+
+data:
+  lm_dataset: fineweb
+  lm_tokenizer: llama2
+  lm_data_dir: ""
+  lm_seq_length: 2048
+
+training:
+  max_steps: 200000
+  output_dir: results/fineweb_llama2
+
+evaluation:
+  eval_checkpoint: results/fineweb_llama2/best

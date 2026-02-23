@@ -1,0 +1,5 @@
+base: wikitext103.yaml
+
+evaluation:
+  eval_mode: lm_harness
+  eval_harness_tasks: arc_easy,hellaswag,piqa,winogrande,copa

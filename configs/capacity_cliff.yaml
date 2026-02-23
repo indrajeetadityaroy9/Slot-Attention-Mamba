@@ -1,8 +1,5 @@
 base: main.yaml
 
 evaluation:
-  mode: capacity_cliff
-  num_samples: 500
-  batch_size: 32
-  sweep_pairs: [32, 48, 64, 80, 96, 112, 128, 160, 192, 256]
-  cliff_threshold: 0.9
+  eval_mode: capacity_cliff
+  eval_num_samples: 500

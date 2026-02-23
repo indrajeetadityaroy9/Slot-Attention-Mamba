@@ -1,0 +1,19 @@
+base: wikitext103.yaml
+
+model:
+  d_model: 2048
+  decoder_layers: 24
+  n_heads: 32
+  block_size: 8
+  kronecker_partitions: 5
+  kronecker_subdim: 4
+  top_k_slots: 32
+
+training:
+  batch_size: 4
+  max_steps: 300000
+  output_dir: results/lm_1_3b
+
+evaluation:
+  eval_batch_size: 4
+  eval_checkpoint: results/lm_1_3b/best

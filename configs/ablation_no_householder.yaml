@@ -1,0 +1,4 @@
+base: main.yaml
+
+model:
+  n_householder_steps: 1

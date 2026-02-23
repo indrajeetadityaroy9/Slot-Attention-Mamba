@@ -1,0 +1,37 @@
+run:
+  task: lm
+
+model:
+  d_model: 256
+  encoder_layers: 0
+  decoder_layers: 6
+  d_state: 64
+  n_heads: 4
+  vocab_size: 50257
+  dropout: 0.1
+  block_size: 4
+  n_householder_steps: 2
+  kronecker_partitions: 5
+  kronecker_subdim: 4
+  top_k_slots: 8
+  use_injection: false
+  use_pdma: true
+  use_surprise_gate: true
+  mamba_expand: 2
+  mamba_d_conv: 4
+
+data:
+  lm_data_dir: data/wikitext-103-raw
+  lm_seq_length: 1024
+
+training:
+  batch_size: 32
+  max_steps: 100000
+  seed: 42
+  output_dir: results/wikitext103
+  resume_from: ""
+
+evaluation:
+  eval_mode: standard
+  eval_batch_size: 16
+  eval_checkpoint: results/wikitext103/best
