@@ -53,10 +53,11 @@ class Config:
     resume_from: str = ""
 
     task: str = "mqar"
-    lm_data_dir: str = ""
     lm_seq_length: int = 1024
 
-    lm_dataset: str = "wikitext103"
+    lm_dataset: str = "Salesforce/wikitext"
+    lm_dataset_config: str = "wikitext-103-raw-v1"
+    lm_dataset_streaming: bool = False
     lm_tokenizer: str = "gpt2"
 
     eval_mode: str = "standard"
@@ -98,6 +99,10 @@ def load_yaml(path: str):
         config.eval_max_num_pairs = max(sweep_max, grid_max)
 
     if config.task == "lm":
-        config.vocab_size = {"gpt2": 50257, "llama2": 32000}[config.lm_tokenizer]
+        from transformers import AutoTokenizer
+        config.vocab_size = AutoTokenizer.from_pretrained(config.lm_tokenizer).vocab_size
+
+    assert not (config.encoder_layers == 0 and config.use_injection), \
+        "use_injection requires encoder_layers > 0"
 
     return config

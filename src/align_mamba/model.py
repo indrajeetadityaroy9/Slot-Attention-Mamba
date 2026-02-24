@@ -235,7 +235,7 @@ class HKSU(nn.Module):
             w_full = torch.zeros(B, M, device=h.device, dtype=h.dtype)
             w_full.scatter_(1, write_idx, write_w)
             if self.use_pdma:
-                decay = (1.0 - w_full) ** self.gamma
+                decay = (1.0 - w_full) ** F.softplus(self.gamma)
                 K_slots = decay.unsqueeze(-1) * K_slots
                 V_slots = decay.unsqueeze(-1) * V_slots
                 z_K = decay * z_K + w_full

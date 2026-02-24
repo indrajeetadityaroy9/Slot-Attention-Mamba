@@ -7,7 +7,6 @@ model:
   decoder_layers: 6
   d_state: 64
   n_heads: 4
-  vocab_size: 50257
   dropout: 0.1
   block_size: 4
   n_householder_steps: 2
@@ -21,7 +20,8 @@ model:
   mamba_d_conv: 4
 
 data:
-  lm_data_dir: data/wikitext-103-raw
+  lm_dataset: "Salesforce/wikitext"
+  lm_dataset_config: "wikitext-103-raw-v1"
   lm_seq_length: 1024
 
 training:

@@ -1,9 +1,10 @@
 base: wikitext103.yaml
 
 data:
-  lm_dataset: fineweb
-  lm_tokenizer: llama2
-  lm_data_dir: ""
+  lm_dataset: "HuggingFaceFW/fineweb-edu"
+  lm_dataset_config: "sample-10BT"
+  lm_tokenizer: "meta-llama/Llama-2-7b-hf"
+  lm_dataset_streaming: true
   lm_seq_length: 2048
 
 training:

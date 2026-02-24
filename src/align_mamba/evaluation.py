@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from torchmetrics.classification import MulticlassAccuracy
 
 from align_mamba.config import Config, IGNORE_INDEX
-from align_mamba.data import MQARDataset, _load_wikitext, _load_fineweb, _get_tokenizer
+from align_mamba.data import MQARDataset, _load_hf_dataset, _load_streaming_dataset, get_tokenizer
 from align_mamba.kernels.loss import fused_cross_entropy_loss
 
 # Dense around the d_state boundary to detect the capacity cliff.
@@ -170,11 +170,18 @@ def perplexity_loop(
 
 def evaluate_perplexity(model: nn.Module, config: Config) -> dict:
     device = next(model.parameters()).device
+    tokenizer = get_tokenizer(config.lm_tokenizer)
 
-    if config.lm_dataset == "fineweb":
-        dataset = _load_fineweb("test", config.lm_seq_length, config.lm_tokenizer)
+    if config.lm_dataset_streaming:
+        dataset = _load_streaming_dataset(
+            config.lm_dataset, config.lm_dataset_config,
+            "test", config.lm_seq_length, tokenizer,
+        )
     else:
-        dataset = _load_wikitext(config.lm_data_dir, "test", config.lm_seq_length, config.lm_tokenizer)
+        dataset = _load_hf_dataset(
+            config.lm_dataset, config.lm_dataset_config,
+            "test", config.lm_seq_length, tokenizer,
+        )
     loader = DataLoader(dataset, batch_size=config.eval_batch_size, pin_memory=True)
 
     ppl, avg_loss, total_tokens = perplexity_loop(model, loader, device)
@@ -196,12 +203,11 @@ def evaluate_harness(model: nn.Module, config: Config) -> dict:
             self._model = model
             self._config = config
             self._device = next(model.parameters()).device
-            self._encode = _get_tokenizer(config.lm_tokenizer)
-            self._tok = None
+            self._tokenizer = get_tokenizer(config.lm_tokenizer)
 
         @property
         def eot_token_id(self):
-            return 50256 if self._config.lm_tokenizer == "gpt2" else 2
+            return self._tokenizer.eos_token_id
 
         @property
         def max_length(self):
@@ -220,18 +226,10 @@ def evaluate_harness(model: nn.Module, config: Config) -> dict:
             return self._device
 
         def tok_encode(self, string: str) -> list[int]:
-            return self._encode(string)
+            return self._tokenizer.encode(string, add_special_tokens=False)
 
         def tok_decode(self, tokens: list[int]) -> str:
-            if self._config.lm_tokenizer == "gpt2":
-                import tiktoken
-
-                return tiktoken.get_encoding("gpt2").decode(tokens)
-            if self._tok is None:
-                from transformers import AutoTokenizer
-
-                self._tok = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
-            return self._tok.decode(tokens)
+            return self._tokenizer.decode(tokens)
 
         def _model_call(self, inps):
             with torch.no_grad():

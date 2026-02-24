@@ -1,9 +1,9 @@
 import random
-from pathlib import Path
-from typing import Callable
 
 import torch
+from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
 
 from align_mamba.config import (
     Config,
@@ -16,36 +16,22 @@ from align_mamba.config import (
 )
 
 _SPLIT_OFFSETS: dict[str, int] = {"train": 0, "validation": 1000, "test": 2000}
-_WIKITEXT_SPLITS: dict[str, str] = {
-    "train": "wiki.train.raw",
-    "validation": "wiki.valid.raw",
-    "test": "wiki.test.raw",
-}
 _NUM_WORKERS = 4
 
-_FINEWEB_DATASET = "HuggingFaceFW/fineweb-edu"
-_FINEWEB_SUBSET = "sample-10BT"
-_FINEWEB_TOKEN_TARGETS: dict[str, int] = {
+_STREAMING_TOKEN_TARGETS: dict[str, int] = {
     "train": 100_000_000,
     "validation": 1_000_000,
     "test": 1_000_000,
 }
+_STREAMING_SKIP: dict[str, int] = {
+    "train": 0,
+    "validation": 100_000_000,
+    "test": 101_000_000,
+}
 
 
-def _get_tokenizer(name: str) -> Callable[[str], list[int]]:
-    if name == "gpt2":
-        import tiktoken
-
-        enc = tiktoken.get_encoding("gpt2")
-        return enc.encode_ordinary
-
-    if name == "llama2":
-        from transformers import AutoTokenizer
-
-        tok = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
-        return lambda text: tok.encode(text, add_special_tokens=False)
-
-    raise KeyError(name)
+def get_tokenizer(name: str) -> AutoTokenizer:
+    return AutoTokenizer.from_pretrained(name)
 
 
 class MQARDataset(Dataset):
@@ -107,24 +93,50 @@ class LMDataset(Dataset):
         return {"input_ids": chunk, "labels": chunk}
 
 
-def _load_wikitext(data_dir: str, split: str, seq_length: int, tokenizer_name: str) -> LMDataset:
-    path = Path(data_dir) / _WIKITEXT_SPLITS[split]
-    encode = _get_tokenizer(tokenizer_name)
-    tokens = torch.tensor(encode(path.read_text(encoding="utf-8")), dtype=torch.long)
-    return LMDataset(tokens, seq_length)
+def _load_hf_dataset(
+    dataset_path: str,
+    config_name: str,
+    split: str,
+    seq_length: int,
+    tokenizer: AutoTokenizer,
+):
+    ds = load_dataset(dataset_path, config_name, split=split)
+
+    def tokenize_fn(batch):
+        return {"input_ids": tokenizer(batch["text"], add_special_tokens=False)["input_ids"]}
+
+    ds = ds.map(tokenize_fn, batched=True, num_proc=4, remove_columns=ds.column_names)
+
+    def group_texts(batch):
+        concatenated = sum(batch["input_ids"], [])
+        total_length = (len(concatenated) // seq_length) * seq_length
+        result = [concatenated[i : i + seq_length] for i in range(0, total_length, seq_length)]
+        return {"input_ids": result, "labels": result}
+
+    ds = ds.map(group_texts, batched=True, num_proc=4, remove_columns=["input_ids"])
+    ds.set_format("torch")
+    return ds
 
 
-def _load_fineweb(split: str, seq_length: int, tokenizer_name: str) -> LMDataset:
-    from datasets import load_dataset
-
-    encode = _get_tokenizer(tokenizer_name)
-    # FineWeb-Edu exposes only a train split; use streaming and cap by token target.
-    ds = load_dataset(_FINEWEB_DATASET, _FINEWEB_SUBSET, split="train", streaming=True)
-    target = _FINEWEB_TOKEN_TARGETS[split]
+def _load_streaming_dataset(
+    dataset_path: str,
+    config_name: str,
+    split: str,
+    seq_length: int,
+    tokenizer: AutoTokenizer,
+) -> LMDataset:
+    ds = load_dataset(dataset_path, config_name, split="train", streaming=True)
+    skip = _STREAMING_SKIP[split]
+    target = _STREAMING_TOKEN_TARGETS[split]
 
     all_tokens: list[int] = []
+    skipped = 0
     for example in ds:
-        all_tokens.extend(encode(example["text"]))
+        toks = tokenizer.encode(example["text"], add_special_tokens=False)
+        if skipped < skip:
+            skipped += len(toks)
+            continue
+        all_tokens.extend(toks)
         if len(all_tokens) >= target:
             break
 
@@ -142,12 +154,21 @@ def create_dataloaders(config: Config) -> tuple[DataLoader, DataLoader]:
     }
 
     if config.task == "lm":
-        if config.lm_dataset == "fineweb":
-            train = _load_fineweb("train", config.lm_seq_length, config.lm_tokenizer)
-            val = _load_fineweb("validation", config.lm_seq_length, config.lm_tokenizer)
+        tokenizer = get_tokenizer(config.lm_tokenizer)
+
+        if config.lm_dataset_streaming:
+            load_fn = lambda split: _load_streaming_dataset(
+                config.lm_dataset, config.lm_dataset_config,
+                split, config.lm_seq_length, tokenizer,
+            )
         else:
-            train = _load_wikitext(config.lm_data_dir, "train", config.lm_seq_length, config.lm_tokenizer)
-            val = _load_wikitext(config.lm_data_dir, "validation", config.lm_seq_length, config.lm_tokenizer)
+            load_fn = lambda split: _load_hf_dataset(
+                config.lm_dataset, config.lm_dataset_config,
+                split, config.lm_seq_length, tokenizer,
+            )
+
+        train = load_fn("train")
+        val = load_fn("validation")
         return (
             DataLoader(train, shuffle=True, **loader_kwargs),
             DataLoader(val, shuffle=False, **loader_kwargs),
