@@ -6,30 +6,17 @@ import torch.nn.functional as F
 from mamba_ssm import Mamba2
 from flash_attn import flash_attn_func
 
-from align_mamba.config import Config, PAD_TOKEN_ID
-from align_mamba.kernels.rmsnorm import fused_rmsnorm
+from config import Config, PAD_TOKEN_ID
+from kernels.rmsnorm import fused_rmsnorm
 
-_ROPE_BASE = 10000.0
-_RMSNORM_EPS = 1e-5
-_HOUSEHOLDER_BETA_MAX = 2.0  # Keep reflector amplitude bounded.
-_DECAY_GAMMA_INIT = 1.0
+# Triton RMSNorm kernel upcasts all inputs to float32 before computing variance.
+# The stability epsilon matches float32 precision — the kernel's internal arithmetic
+# dtype — regardless of the model's compute dtype.
+_RMSNORM_EPS = torch.finfo(torch.float32).eps
 
-
-def _retention_bias(top_k: int) -> float:
-    #Set sigmoid(bias) to the default retention (K-1)/K.
-    return math.log(max(top_k - 1, 1))
-
-
-def encoder_attn_positions(n_layers: int) -> frozenset[int]:
-    return frozenset(range(n_layers // 2, n_layers, 2))
-
-
-def decoder_inject_positions(n_layers: int) -> frozenset[int]:
-    return frozenset(range(0, n_layers // 2, 2))
-
-
-def decoder_attn_position(n_layers: int) -> int:
-    return n_layers - 2
+# H = I - beta * v * v^T is an orthogonal reflector iff beta in [0, 2].
+# (Golub & Van Loan, 4th ed., Section 5.1.)
+_HOUSEHOLDER_BETA_BOUND = 2.0
 
 
 class RMSNorm(nn.Module):
@@ -47,7 +34,7 @@ class Embedding(nn.Module):
                  padding_idx: int | None = PAD_TOKEN_ID, dtype: torch.dtype | None = None):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, d_model, padding_idx=padding_idx, device="cuda")
-        self.scale = nn.Parameter(torch.tensor(math.sqrt(d_model), device="cuda", dtype=dtype))
+        self.scale = nn.Parameter(torch.tensor(math.sqrt(d_model), device="cuda", dtype=dtype))  # Vaswani et al. (2017)
         self.dropout = nn.Dropout(dropout)
         self.dtype = dtype
 
@@ -56,9 +43,9 @@ class Embedding(nn.Module):
 
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int):
+    def __init__(self, dim: int, max_seq_len: int, base: float):
         super().__init__()
-        inv_freq = 1.0 / (_ROPE_BASE ** (torch.arange(0, dim, 2, device="cuda").float() / dim))
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device="cuda").float() / dim))
         t = torch.arange(max_seq_len, device="cuda", dtype=inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         emb = torch.cat([freqs, freqs], dim=-1)
@@ -107,7 +94,7 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(d, d * 3, bias=False, device="cuda", dtype=dtype)
         self.out = nn.Linear(d, d, bias=False, device="cuda", dtype=dtype)
         # RoPE cache must cover both train and eval sequence lengths.
-        n_registers = 2 * config.n_heads
+        n_registers = config.n_registers
         if config.task == "lm":
             max_seq_len = (config.lm_seq_length - 1) + n_registers
         else:
@@ -115,7 +102,7 @@ class Attention(nn.Module):
             src_len = 3 * effective_pairs + 2
             tgt_len = effective_pairs + 2 + n_registers
             max_seq_len = max(src_len, tgt_len)
-        self.rope = RotaryEmbedding(self.head_dim, max_seq_len)
+        self.rope = RotaryEmbedding(self.head_dim, max_seq_len, base=config.rope_base)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -197,7 +184,7 @@ class HKSU(nn.Module):
         self.M = config.kronecker_subdim ** config.kronecker_partitions
         self.n_h = n_h
         self.use_pdma = config.use_pdma
-        self.scale = d ** -0.5
+        self.scale = d ** -0.5  # Var(q^T k) = d normalization.
 
         self.W_k = nn.Linear(d, d_k, bias=False, device="cuda", dtype=dtype)
         self.W_q = nn.Linear(d, d_k, bias=False, device="cuda", dtype=dtype)
@@ -209,7 +196,7 @@ class HKSU(nn.Module):
         self.hh_v_projs_v = nn.ModuleList([nn.Linear(d, d, bias=False, device="cuda", dtype=dtype) for _ in range(n_h)])
         self.hh_beta_projs = nn.ModuleList([nn.Linear(d, 1, bias=True, device="cuda", dtype=dtype) for _ in range(n_h)])
 
-        self.gamma = nn.Parameter(torch.tensor(_DECAY_GAMMA_INIT, device="cuda", dtype=dtype))
+        self.gamma = nn.Parameter(torch.tensor(config.decay_gamma_init, device="cuda", dtype=dtype))
         self.W_out = nn.Linear(d, d, bias=False, device="cuda", dtype=dtype)
         self.W_gate = nn.Linear(d, d, bias=False, device="cuda", dtype=dtype)
 
@@ -230,7 +217,7 @@ class HKSU(nn.Module):
             h_t = h[:, t]
 
             write_idx, write_w = self.write_addr(self.W_k(h_t))
-            read_idx, read_w = self.read_addr(self.W_q(h_t))
+            read_idx, _ = self.read_addr(self.W_q(h_t))
 
             w_full = torch.zeros(B, M, device=h.device, dtype=h.dtype)
             w_full.scatter_(1, write_idx, write_w)
@@ -253,7 +240,7 @@ class HKSU(nn.Module):
                 k_hat = F.normalize(k_j, dim=-1)
                 v_kj = self.hh_v_projs_k[j](h_t)
                 v_vj = self.hh_v_projs_v[j](h_t)
-                beta_j = _HOUSEHOLDER_BETA_MAX * torch.sigmoid(self.hh_beta_projs[j](h_t))
+                beta_j = _HOUSEHOLDER_BETA_BOUND * torch.sigmoid(self.hh_beta_projs[j](h_t))
 
                 k_hat_e = k_hat.unsqueeze(1)
                 beta_e = beta_j.unsqueeze(1)
@@ -290,10 +277,10 @@ class SurpriseGate(nn.Module):
     def __init__(self, config: Config, *, n_gate_slots: int, dtype: torch.dtype | None = None):
         super().__init__()
         d = config.d_model
-        self.scale = d ** -0.5
+        self.scale = d ** -0.5  # Var(q^T k) = d normalization.
         self.k_gate_proj = nn.Linear(2, n_gate_slots, bias=True, device="cuda", dtype=dtype)
         self.v_gate_proj = nn.Linear(2, n_gate_slots, bias=True, device="cuda", dtype=dtype)
-        retention_bias = _retention_bias(config.top_k_slots)
+        retention_bias = math.log(config.top_k_slots - 1)  # Log-odds of uniform retention.
         nn.init.constant_(self.k_gate_proj.bias, retention_bias)
         nn.init.constant_(self.v_gate_proj.bias, retention_bias)
         # Initialize EMA to roughly a sequence-length window.
@@ -350,7 +337,7 @@ class DecoupledInjection(nn.Module):
     def __init__(self, config: Config, *, dtype: torch.dtype | None = None):
         super().__init__()
         d = config.d_model
-        self.scale = d ** -0.5
+        self.scale = d ** -0.5  # Var(q^T k) = d normalization.
         self.W_cross = nn.Linear(d, d, bias=False, device="cuda", dtype=dtype)
         self.W_ek = nn.Linear(d, d, bias=False, device="cuda", dtype=dtype)
         self.W_ev = nn.Linear(d, d, bias=False, device="cuda", dtype=dtype)
@@ -456,7 +443,7 @@ class Encoder(nn.Module):
         n_layers = config.encoder_layers
         pad = None if config.task == "lm" else PAD_TOKEN_ID
         self.embed = Embedding(config.vocab_size, d, config.dropout, padding_idx=pad, dtype=dtype)
-        attn_pos = encoder_attn_positions(n_layers)
+        attn_pos = frozenset(range(config.encoder_attn_start, n_layers, config.encoder_attn_stride))
         self.layers = nn.ModuleList([
             Attention(config, dtype=dtype) if i in attn_pos
             else BiMambaBlock(config, dtype=dtype)
@@ -476,8 +463,8 @@ class Decoder(nn.Module):
         super().__init__()
         d = config.d_model
         n_layers = config.decoder_layers
-        attn_layer = decoder_attn_position(n_layers)
-        inject_set = decoder_inject_positions(n_layers)
+        attn_layer = config.decoder_causal_attn_pos
+        inject_set = frozenset(range(0, config.decoder_inject_end, config.decoder_inject_stride))
 
         self.M = config.kronecker_subdim ** config.kronecker_partitions
         self.d_model = d
@@ -486,7 +473,7 @@ class Decoder(nn.Module):
         self.embed = Embedding(config.vocab_size, d, config.dropout, padding_idx=pad, dtype=dtype)
         self.norm = RMSNorm(d, dtype=dtype)
         self.head = nn.Linear(d, config.vocab_size, bias=False, device="cuda", dtype=dtype)
-        self.n_registers = 2 * config.n_heads
+        self.n_registers = config.n_registers
         self.registers = nn.Parameter(torch.randn(1, self.n_registers, d, device="cuda", dtype=dtype) * (d ** -0.5))
 
         self.layers = nn.ModuleList()

@@ -1,3 +1,6 @@
+import itertools
+import math
+import os
 import random
 
 import torch
@@ -5,7 +8,7 @@ from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 
-from align_mamba.config import (
+from config import (
     Config,
     BOS_TOKEN_ID,
     EOS_TOKEN_ID,
@@ -13,25 +16,30 @@ from align_mamba.config import (
     IGNORE_INDEX,
     key_range,
     value_range,
+    split_seed_offset,
 )
 
-_SPLIT_OFFSETS: dict[str, int] = {"train": 0, "validation": 1000, "test": 2000}
-_NUM_WORKERS = 4
-
-_STREAMING_TOKEN_TARGETS: dict[str, int] = {
-    "train": 100_000_000,
-    "validation": 1_000_000,
-    "test": 1_000_000,
-}
-_STREAMING_SKIP: dict[str, int] = {
-    "train": 0,
-    "validation": 100_000_000,
-    "test": 101_000_000,
-}
+_NUM_WORKERS = os.cpu_count() // 2
 
 
-def get_tokenizer(name: str) -> AutoTokenizer:
-    return AutoTokenizer.from_pretrained(name)
+def _streaming_targets(config: Config) -> dict[str, int]:
+    """Derive token counts from training scale.
+
+    Train: enough tokens for max_steps at full batch utilization.
+    Val/test: train / log(max_steps), scaling with training duration.
+    """
+    train_tokens = config.batch_size * config.lm_seq_length * config.max_steps
+    val_test = train_tokens // round(math.log(config.max_steps))
+    return {"train": train_tokens, "validation": val_test, "test": val_test}
+
+
+def _streaming_skips(targets: dict[str, int]) -> dict[str, int]:
+    """Cumulative offsets so splits don't overlap in the stream."""
+    return {
+        "train": 0,
+        "validation": targets["train"],
+        "test": targets["train"] + targets["validation"],
+    }
 
 
 class MQARDataset(Dataset):
@@ -50,7 +58,7 @@ class MQARDataset(Dataset):
         self.key_start, self.key_end = key_range(vocab_size)
         self.val_start, self.val_end = value_range(vocab_size)
 
-        self._rng = random.Random(seed + _SPLIT_OFFSETS[split])
+        self._rng = random.Random(seed + split_seed_offset(split))
         self._samples = [self._gen() for _ in range(num_samples)]
 
     def _gen(self) -> dict[str, torch.Tensor]:
@@ -105,29 +113,29 @@ def _load_hf_dataset(
     def tokenize_fn(batch):
         return {"input_ids": tokenizer(batch["text"], add_special_tokens=False)["input_ids"]}
 
-    ds = ds.map(tokenize_fn, batched=True, num_proc=4, remove_columns=ds.column_names)
+    ds = ds.map(tokenize_fn, batched=True, num_proc=_NUM_WORKERS, remove_columns=ds.column_names)
 
     def group_texts(batch):
-        concatenated = sum(batch["input_ids"], [])
+        concatenated = list(itertools.chain.from_iterable(batch["input_ids"]))
         total_length = (len(concatenated) // seq_length) * seq_length
         result = [concatenated[i : i + seq_length] for i in range(0, total_length, seq_length)]
         return {"input_ids": result, "labels": result}
 
-    ds = ds.map(group_texts, batched=True, num_proc=4, remove_columns=["input_ids"])
+    ds = ds.map(group_texts, batched=True, num_proc=_NUM_WORKERS, remove_columns=["input_ids"])
     ds.set_format("torch")
     return ds
 
 
 def _load_streaming_dataset(
-    dataset_path: str,
-    config_name: str,
+    config: Config,
     split: str,
-    seq_length: int,
     tokenizer: AutoTokenizer,
 ) -> LMDataset:
-    ds = load_dataset(dataset_path, config_name, split="train", streaming=True)
-    skip = _STREAMING_SKIP[split]
-    target = _STREAMING_TOKEN_TARGETS[split]
+    ds = load_dataset(config.lm_dataset, config.lm_dataset_config, split="train", streaming=True)
+    targets = _streaming_targets(config)
+    skips = _streaming_skips(targets)
+    skip = skips[split]
+    target = targets[split]
 
     all_tokens: list[int] = []
     skipped = 0
@@ -141,7 +149,17 @@ def _load_streaming_dataset(
             break
 
     tokens = torch.tensor(all_tokens[:target], dtype=torch.long)
-    return LMDataset(tokens, seq_length)
+    return LMDataset(tokens, config.lm_seq_length)
+
+
+def load_lm_dataset(config: Config, split: str):
+    tokenizer = AutoTokenizer.from_pretrained(config.lm_tokenizer)
+    if config.lm_dataset_streaming:
+        return _load_streaming_dataset(config, split, tokenizer)
+    return _load_hf_dataset(
+        config.lm_dataset, config.lm_dataset_config,
+        split, config.lm_seq_length, tokenizer,
+    )
 
 
 def create_dataloaders(config: Config) -> tuple[DataLoader, DataLoader]:
@@ -154,21 +172,8 @@ def create_dataloaders(config: Config) -> tuple[DataLoader, DataLoader]:
     }
 
     if config.task == "lm":
-        tokenizer = get_tokenizer(config.lm_tokenizer)
-
-        if config.lm_dataset_streaming:
-            load_fn = lambda split: _load_streaming_dataset(
-                config.lm_dataset, config.lm_dataset_config,
-                split, config.lm_seq_length, tokenizer,
-            )
-        else:
-            load_fn = lambda split: _load_hf_dataset(
-                config.lm_dataset, config.lm_dataset_config,
-                split, config.lm_seq_length, tokenizer,
-            )
-
-        train = load_fn("train")
-        val = load_fn("validation")
+        train = load_lm_dataset(config, "train")
+        val = load_lm_dataset(config, "validation")
         return (
             DataLoader(train, shuffle=True, **loader_kwargs),
             DataLoader(val, shuffle=False, **loader_kwargs),

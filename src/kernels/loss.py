@@ -2,7 +2,13 @@ import torch
 import triton
 import triton.language as tl
 
-_MAX_CE_BLOCK = 4096
+# Derive maximum CE kernel block size from GPU shared memory capacity.
+# Each element is float32 (4 bytes); reserve half of shared memory for
+# Triton compiler overhead and other kernel allocations.
+_props = torch.cuda.get_device_properties(0)
+_MAX_CE_BLOCK = triton.next_power_of_2(
+    _props.max_shared_memory_per_multiprocessor // (2 * 4)
+)
 
 
 @triton.jit

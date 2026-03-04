@@ -2,12 +2,9 @@ import argparse
 import json
 from pathlib import Path
 
-import torch
-
-from align_mamba.config import load_yaml
-from align_mamba.model import load_checkpoint
-from align_mamba.evaluation import run_evaluation
-from align_mamba.training import emit_log
+from config import load_yaml, DTYPE_MAP
+from model import load_checkpoint
+from evaluation import run_evaluation
 
 
 def main():
@@ -16,11 +13,12 @@ def main():
     args = parser.parse_args()
 
     config = load_yaml(args.config)
-    model = load_checkpoint(config.eval_checkpoint, config, dtype=torch.bfloat16)
+    compute_dtype = DTYPE_MAP[config.compute_dtype]
+    model = load_checkpoint(config.eval_checkpoint, config, dtype=compute_dtype)
 
     results = run_evaluation(model, config)
     results["params"] = sum(p.numel() for p in model.parameters())
-    emit_log(event="eval_complete", **results)
+    print(f"[eval_complete] {results}")
 
     out = Path(config.output_dir)
     out.mkdir(parents=True, exist_ok=True)

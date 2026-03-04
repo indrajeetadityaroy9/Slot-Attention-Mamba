@@ -1,18 +1,67 @@
 import math
+import sys
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchmetrics.classification import MulticlassAccuracy
 
-from align_mamba.config import Config, IGNORE_INDEX
-from align_mamba.data import MQARDataset, _load_hf_dataset, _load_streaming_dataset, get_tokenizer
-from align_mamba.kernels.loss import fused_cross_entropy_loss
+import lm_eval
+from lm_eval.api.model import LM
+from lm_eval.api.instance import Instance
 
-# Dense around the d_state boundary to detect the capacity cliff.
-_SWEEP_RATIOS = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0)
-_NUM_EVAL_SEEDS = 3
-_RAMNET_GRID = (4, 8, 16, 32, 64, 128, 256)
+from config import Config, IGNORE_INDEX
+from transformers import AutoTokenizer
+
+from data import MQARDataset, load_lm_dataset
+from kernels.loss import fused_cross_entropy_loss
+
+# IEEE 754: exp(log(DBL_MAX)) == DBL_MAX. Exact overflow cap.
+_LOG_EXP_MAX = math.log(sys.float_info.max)
+
+
+def _sweep_ratios(d_state: int) -> tuple[float, ...]:
+    """Generate capacity-cliff sweep ratios from d_state.
+
+    Point count = log2(d_state), density adapts to model scale.
+    Range: 2^(-1) (half-capacity) to log2(d_state) (well beyond capacity).
+    """
+    n = round(math.log2(d_state))
+    upper = math.log2(d_state)
+    log_lo = math.log10(0.5)
+    log_hi = math.log10(upper)
+    ratios = [10 ** (log_lo + i * (log_hi - log_lo) / (n - 1)) for i in range(n)]
+    return tuple(ratios)
+
+
+def _eval_grid(d_state: int) -> tuple[int, ...]:
+    """Powers of 2 from 2^2 up to 2^(log2(d_state)+1).
+
+    Range and count both derived from d_state.
+    """
+    upper_exp = round(math.log2(d_state)) + 1
+    return tuple(1 << k for k in range(2, upper_exp + 1))
+
+
+def mqar_accuracy_loop(
+    model: nn.Module,
+    loader: DataLoader,
+    vocab_size: int,
+) -> float:
+    accuracy = MulticlassAccuracy(
+        num_classes=vocab_size,
+        ignore_index=IGNORE_INDEX,
+        average="micro",
+    ).to("cuda")
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = {k: v.to("cuda", non_blocking=True) for k, v in batch.items()}
+            logits = model(batch["src_ids"], batch["tgt_ids"][:, :-1])
+            labels = batch["labels"]
+            accuracy.update(logits.view(-1, logits.size(-1)), labels.reshape(-1))
+
+    return accuracy.compute().item()
 
 
 def evaluate(
@@ -20,12 +69,10 @@ def evaluate(
     *,
     num_pairs: int,
     vocab_size: int,
-    seed: int = 42,
-    num_samples: int = 1000,
-    batch_size: int = 32,
+    seed: int,
+    num_samples: int,
+    batch_size: int,
 ) -> dict:
-    device = next(model.parameters()).device
-
     dataset = MQARDataset(
         num_pairs,
         num_pairs,
@@ -35,21 +82,8 @@ def evaluate(
         seed=seed,
     )
     loader = DataLoader(dataset, batch_size=batch_size, pin_memory=True)
-
-    accuracy = MulticlassAccuracy(
-        num_classes=vocab_size,
-        ignore_index=IGNORE_INDEX,
-        average="micro",
-    ).to(device)
-
-    with torch.no_grad():
-        for batch in loader:
-            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            logits = model(batch["src_ids"], batch["tgt_ids"][:, :-1])
-            labels = batch["labels"][:, : logits.size(1)]
-            accuracy.update(logits.view(-1, logits.size(-1)), labels.reshape(-1))
-
-    return {"token_accuracy": accuracy.compute().item(), "num_pairs": num_pairs}
+    acc = mqar_accuracy_loop(model, loader, vocab_size)
+    return {"token_accuracy": acc, "num_pairs": num_pairs}
 
 
 def _aggregate_seeds(
@@ -60,6 +94,7 @@ def _aggregate_seeds(
     base_seed: int,
     num_samples: int,
     batch_size: int,
+    num_eval_seeds: int,
 ) -> dict:
     accs = [
         evaluate(
@@ -70,7 +105,7 @@ def _aggregate_seeds(
             num_samples=num_samples,
             batch_size=batch_size,
         )["token_accuracy"]
-        for i in range(_NUM_EVAL_SEEDS)
+        for i in range(num_eval_seeds)
     ]
     t = torch.tensor(accs)
     return {
@@ -83,7 +118,7 @@ def _aggregate_seeds(
 
 def capacity_cliff(model: nn.Module, config: Config) -> dict:
     d_state = config.d_state
-    sweep = [int(d_state * r) for r in _SWEEP_RATIOS]
+    sweep = [int(d_state * r) for r in _sweep_ratios(d_state)]
     results = []
 
     for np_ in sweep:
@@ -94,6 +129,7 @@ def capacity_cliff(model: nn.Module, config: Config) -> dict:
             base_seed=config.seed,
             num_samples=config.eval_num_samples,
             batch_size=config.eval_batch_size,
+            num_eval_seeds=config.num_eval_seeds,
         )
         results.append(
             {
@@ -115,13 +151,13 @@ def capacity_cliff(model: nn.Module, config: Config) -> dict:
     return {
         "results": results,
         "cliff_point": cliff,
-        "max_drop": round(max_drop, 6),
+        "max_drop": max_drop,
         "d_state": d_state,
     }
 
 
 def multi_config_grid(model: nn.Module, config: Config) -> dict:
-    grid = [int(x) for x in config.eval_grid.split(",") if x.strip()] if config.eval_grid else list(_RAMNET_GRID)
+    grid = [int(x) for x in config.eval_grid.split(",")] if config.eval_grid else list(_eval_grid(config.d_state))
     results = []
 
     for np_ in grid:
@@ -132,6 +168,7 @@ def multi_config_grid(model: nn.Module, config: Config) -> dict:
             base_seed=config.seed,
             num_samples=config.eval_num_samples,
             batch_size=config.eval_batch_size,
+            num_eval_seeds=config.num_eval_seeds,
         )
         results.append(
             {
@@ -143,20 +180,19 @@ def multi_config_grid(model: nn.Module, config: Config) -> dict:
 
     accs = [r["token_accuracy_mean"] for r in results]
     uniform_avg = sum(accs) / len(accs)
-    return {"results": results, "uniform_avg_accuracy": round(uniform_avg, 6)}
+    return {"results": results, "uniform_avg_accuracy": uniform_avg}
 
 
 def perplexity_loop(
     model: nn.Module,
     loader: DataLoader,
-    device: torch.device,
-) -> tuple[float, float, int]:
+) -> tuple[float, int]:
     total_loss = 0.0
     total_tokens = 0
 
     with torch.no_grad():
         for batch in loader:
-            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            batch = {k: v.to("cuda", non_blocking=True) for k, v in batch.items()}
             logits = model(None, batch["input_ids"][:, :-1])
             labels = batch["labels"][:, 1:]
             loss = fused_cross_entropy_loss(logits, labels, smoothing=0.0, ignore_index=IGNORE_INDEX)
@@ -164,46 +200,30 @@ def perplexity_loop(
             total_loss += loss.item() * n
             total_tokens += n
 
-    avg_loss = total_loss / total_tokens
-    return math.exp(avg_loss), avg_loss, total_tokens
+    return total_loss, total_tokens
 
 
 def evaluate_perplexity(model: nn.Module, config: Config) -> dict:
-    device = next(model.parameters()).device
-    tokenizer = get_tokenizer(config.lm_tokenizer)
-
-    if config.lm_dataset_streaming:
-        dataset = _load_streaming_dataset(
-            config.lm_dataset, config.lm_dataset_config,
-            "test", config.lm_seq_length, tokenizer,
-        )
-    else:
-        dataset = _load_hf_dataset(
-            config.lm_dataset, config.lm_dataset_config,
-            "test", config.lm_seq_length, tokenizer,
-        )
+    dataset = load_lm_dataset(config, "test")
     loader = DataLoader(dataset, batch_size=config.eval_batch_size, pin_memory=True)
 
-    ppl, avg_loss, total_tokens = perplexity_loop(model, loader, device)
+    total_loss, total_tokens = perplexity_loop(model, loader)
+    avg_loss = total_loss / total_tokens
     return {
-        "perplexity": ppl,
+        "perplexity": math.exp(min(avg_loss, _LOG_EXP_MAX)),
         "avg_cross_entropy": avg_loss,
         "total_tokens": total_tokens,
     }
 
 
 def evaluate_harness(model: nn.Module, config: Config) -> dict:
-    import lm_eval
-    from lm_eval.api.model import LM
-    from lm_eval.api.instance import Instance
-
     class SlotMambaLM(LM):
         def __init__(self, model, config):
             super().__init__()
             self._model = model
             self._config = config
-            self._device = next(model.parameters()).device
-            self._tokenizer = get_tokenizer(config.lm_tokenizer)
+            self._device = "cuda"
+            self._tokenizer = AutoTokenizer.from_pretrained(config.lm_tokenizer)
 
         @property
         def eot_token_id(self):
@@ -215,7 +235,7 @@ def evaluate_harness(model: nn.Module, config: Config) -> dict:
 
         @property
         def max_gen_toks(self):
-            return 256
+            return self._config.max_gen_toks
 
         @property
         def batch_size(self):
@@ -272,8 +292,8 @@ def evaluate_harness(model: nn.Module, config: Config) -> dict:
             results = []
             for req in requests:
                 context, gen_kwargs = req.args
-                max_gen = gen_kwargs.get("max_gen_toks", self.max_gen_toks)
-                stop = gen_kwargs.get("until", [])
+                max_gen = gen_kwargs["max_gen_toks"]
+                stop = gen_kwargs["until"]
                 enc = self.tok_encode(context)
                 inp = enc[:]
                 for _ in range(max_gen):
@@ -288,7 +308,7 @@ def evaluate_harness(model: nn.Module, config: Config) -> dict:
             return results
 
     wrapped = SlotMambaLM(model, config)
-    tasks = [t.strip() for t in config.eval_harness_tasks.split(",")]
+    tasks = config.eval_harness_tasks.split(",")
 
     task_results = lm_eval.simple_evaluate(
         model=wrapped,
@@ -298,12 +318,11 @@ def evaluate_harness(model: nn.Module, config: Config) -> dict:
 
     per_task = {}
     for task_name, task_data in task_results["results"].items():
-        acc_key = "acc,none" if "acc,none" in task_data else "acc_norm,none"
-        per_task[task_name] = task_data.get(acc_key, 0.0)
+        per_task[task_name] = task_data["acc_norm,none"]
 
     return {
         "per_task": per_task,
-        "avg_accuracy": round(sum(per_task.values()) / len(per_task), 6) if per_task else 0.0,
+        "avg_accuracy": sum(per_task.values()) / len(per_task),
     }
 
 
@@ -330,6 +349,7 @@ def run_evaluation(model: nn.Module, config: Config) -> dict:
             base_seed=config.seed,
             num_samples=config.eval_num_samples,
             batch_size=config.eval_batch_size,
+            num_eval_seeds=config.num_eval_seeds,
         )
         result["mode"] = "standard"
 

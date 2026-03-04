@@ -1,13 +1,12 @@
 import argparse
 
-import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-from align_mamba.config import load_yaml
-from align_mamba.model import HybridMambaEncoderDecoder
-from align_mamba.data import create_dataloaders
-from align_mamba.training import Trainer, emit_log
+from config import load_yaml, DTYPE_MAP, MIXED_PRECISION_MAP
+from model import HybridMambaEncoderDecoder
+from data import create_dataloaders
+from training import Trainer
 
 
 def main():
@@ -18,28 +17,22 @@ def main():
     config = load_yaml(args.config)
 
     set_seed(config.seed)
-    accelerator = Accelerator(mixed_precision="bf16")
+    compute_dtype = DTYPE_MAP[config.compute_dtype]
+    accelerator = Accelerator(mixed_precision=MIXED_PRECISION_MAP[config.compute_dtype])
 
-    model = HybridMambaEncoderDecoder(config, dtype=torch.bfloat16)
+    model = HybridMambaEncoderDecoder(config, dtype=compute_dtype)
     train_loader, val_loader = create_dataloaders(config)
 
     if accelerator.is_main_process:
         params = sum(p.numel() for p in model.parameters())
-        log_fields = dict(
-            event="train_start",
-            config_path=args.config,
-            params_m=round(params / 1e6, 3),
-            d_model=config.d_model,
-            task=config.task,
-            max_steps=config.max_steps,
-        )
+        print(f"[start] config={args.config} params={params / 1e6:.3f}M d_model={config.d_model} task={config.task} max_steps={config.max_steps}")
+        print(f"[derived] rope_base={config.rope_base:.1f} decay_gamma_init={config.decay_gamma_init:.4f} "
+              f"label_smoothing={config.label_smoothing:.4f} n_registers={config.n_registers} "
+              f"compute_dtype={config.compute_dtype}")
         if config.task == "lm":
-            log_fields["seq_length"] = config.lm_seq_length
-            log_fields["vocab_size"] = config.vocab_size
+            print(f"  seq_length={config.lm_seq_length} vocab_size={config.vocab_size}")
         else:
-            log_fields["d_state"] = config.d_state
-            log_fields["num_pairs"] = config.num_pairs
-        emit_log(**log_fields)
+            print(f"  d_state={config.d_state} num_pairs={config.num_pairs}")
 
     trainer = Trainer(model, train_loader, config, accelerator, val_loader)
     if config.resume_from:
